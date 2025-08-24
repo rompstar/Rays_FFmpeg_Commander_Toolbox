@@ -3,7 +3,7 @@ GUI front-end for the FFMpeg tool / tested on Ubuntu Linux 25.04
 
 Version: 0.9.0 Beta
 
-![Screenshot description](Screenshot From 2025-08-24 14-17-21.png)
+![Screenshot description](<Screenshot From 2025-08-24 14-17-21.png>)
 
 ## Overview
 
