@@ -13,7 +13,7 @@ The tool provides an intuitive GUI front-end to leverage FFmpeg’s powerful com
 
 ## Testing Notes
 
-I have only tested this on Ubuntu Linux 25.04 / it might work on Mac or PC too, if you fullfuill all the Dependencies.
+I have only tested this on Ubuntu Linux 25.04 / it might work on Mac or PC too, if you fullfill all the Dependencies.
 
 ## Features
 
