@@ -3,6 +3,8 @@ GUI front-end for the FFMpeg tool / tested on Ubuntu Linux 25.04
 
 Version: 0.9.0 Beta
 
+![Screenshot description](Screenshot From 2025-08-24 14-17-21.png)
+
 ## Overview
 
 Ray’s FFmpeg Commander Toolbox is a user-friendly graphical interface for FFmpeg developed in Ubuntu Linux 25.04 version, designed to simplify video conversion and encoding tasks. It supports batch processing of files and VIDEO_TS folders, hardware GPU detection, multiple video and audio codec selections, customizable encoding presets, and more.
