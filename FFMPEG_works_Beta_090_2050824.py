@@ -312,22 +312,25 @@ class FFmpegGUI(Gtk.Window):
 
     def on_choose_files(self, widget):
         dialog = Gtk.FileChooserDialog(title="Select Files",
-                                       parent=self,
-                                       action=Gtk.FileChooserAction.OPEN)
+                                    parent=self,
+                                    action=Gtk.FileChooserAction.OPEN)
         dialog.set_select_multiple(True)
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                           Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+                        Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             files = dialog.get_filenames()
+            # Clear previous selection before adding new files
+            self.batch_files.clear()
             self.batch_files.extend(files)
             self.label_selected.set_text(f"{len(self.batch_files)} files selected")
-            if not self.entry_output.get_text():
+            if not self.entry_output.get_text() and files:
                 first = files[0]
                 base = os.path.basename(first)
                 ext = self.get_combo_text(self.combo_format) or "mp4"
                 self.entry_output.set_text(f"{base}_converted.{ext}")
         dialog.destroy()
+
 
     def on_format_changed(self, combo):
         if self.entry_output.get_text():
