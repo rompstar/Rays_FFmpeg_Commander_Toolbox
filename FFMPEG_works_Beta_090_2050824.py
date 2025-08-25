@@ -266,10 +266,14 @@ class FFmpegGUI(Gtk.Window):
         self.btn_convert.connect("clicked", self.on_convert)
         btn_box.pack_start(self.btn_convert, False, False, 0)
 
+
         self.btn_cancel = Gtk.Button(label="Cancel")
         self.btn_cancel.connect("clicked", self.on_cancel)
         self.btn_cancel.set_sensitive(False)
         btn_box.pack_start(self.btn_cancel, False, False, 0)
+# hide it for now until we figure this out for the Cancel button
+        self.btn_cancel.hide()
+        self.btn_cancel.get_parent().remove(self.btn_cancel)
 
         self.btn_donate = Gtk.Button(label="Donate (PayPal)- buy me a coffee!")
         self.btn_donate.set_name("donate-button")
