@@ -5,7 +5,10 @@ Version: 0.9.0 Beta
 
 ![Screenshot description](<Screenshot From 2025-08-24 14-17-21.png>)
 
-[![Watch the video](https://img.youtube.com/vi/Hm3cHSqLoLc/0.jpg)](https://www.youtube.com/watch?v=Hm3cHSqLoLc)
+## Demo Video
+
+[Video: Rays FFmpeg Commander Tool Beta 0.9.0](https://www.youtube.com/watch?v=Hm3cHSqLoLc)
+
 
 ## Overview
 
