@@ -1,16 +1,20 @@
 import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gdk
+
 import subprocess
 import os
 import threading
 import re
 import webbrowser
-
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GLib, Gdk
+import signal
+import time
+import fcntl
 
 
 def load_style():
     css = b"""
+    /* your existing CSS unchanged */
     window {
         background-color: #C0C0C0;
         font-family: monospace, 'Courier New', Courier, monospace;
@@ -241,7 +245,6 @@ class FFmpegGUI(Gtk.Window):
         self.chk_bw.set_active(False)
         vbox.pack_start(self.chk_bw, False, False, 0)
 
-        # Audio Codec selection UI
         audio_codec_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         vbox.pack_start(audio_codec_box, False, False, 0)
 
@@ -265,15 +268,6 @@ class FFmpegGUI(Gtk.Window):
         self.btn_convert = Gtk.Button(label="Convert")
         self.btn_convert.connect("clicked", self.on_convert)
         btn_box.pack_start(self.btn_convert, False, False, 0)
-
-
-        self.btn_cancel = Gtk.Button(label="Cancel")
-        self.btn_cancel.connect("clicked", self.on_cancel)
-        self.btn_cancel.set_sensitive(False)
-        btn_box.pack_start(self.btn_cancel, False, False, 0)
-# hide it for now until we figure this out for the Cancel button
-        self.btn_cancel.hide()
-        self.btn_cancel.get_parent().remove(self.btn_cancel)
 
         self.btn_donate = Gtk.Button(label="Donate (PayPal)- buy me a coffee!")
         self.btn_donate.set_name("donate-button")
@@ -418,11 +412,22 @@ class FFmpegGUI(Gtk.Window):
             self.label_selected.set_text("No files or folders selected.")
             return
         self.btn_convert.set_sensitive(False)
-        self.btn_cancel.set_sensitive(True)
         self.btn_convert.set_label("Converting...")
         threading.Thread(target=self.process_batch, daemon=True).start()
 
     def process_batch(self):
+        nvenc_presets_map = {
+            "ultrafast": "default",
+            "superfast": "llhp",
+            "faster": "ll",
+            "fast": "hp",
+            "medium": "hq",
+            "slow": "hq",
+            "slower": "hq",
+            "veryslow": "hq",
+            "placebo": "hq",
+        }
+
         self.append_log(f"Starting batch of {len(self.batch_files)} items\n")
         for idx, path in enumerate(self.batch_files):
             self.append_log(f"Processing item {idx+1}: {path}\n")
@@ -435,9 +440,9 @@ class FFmpegGUI(Gtk.Window):
             if not bitrate.isdigit():
                 GLib.idle_add(self.label_selected.set_text, "Bitrate must be numeric")
                 return
+            bitrate_value = int(bitrate)
 
             cq = int(self.scale_cq.get_value())
-            spatial = 1 if self.chk_spatial.get_active() else 0
             codec = self.get_combo_text(self.combo_codec) or "libx264"
             preset = self.get_combo_text(self.combo_preset) or "medium"
             audio_codec = self.get_combo_text(self.combo_audio_codec) or "aac"
@@ -458,6 +463,12 @@ class FFmpegGUI(Gtk.Window):
             else:
                 out_file = out_file_name
 
+            # Map NVENC presets if using NVENC codecs
+            if codec in ["hevc_nvenc", "h264_nvenc"]:
+                preset_to_use = nvenc_presets_map.get(preset, "default")
+            else:
+                preset_to_use = preset
+
             if self.is_videots(work_path):
                 ts_path = os.path.join(work_path, "VIDEO_TS")
                 if not os.path.isdir(ts_path):
@@ -477,50 +488,71 @@ class FFmpegGUI(Gtk.Window):
                 filter_complex = f"concat=n={n}:v=1:a=1 [v] [a]; [v] scale=iw:ih [vout]"
 
                 cmd = [
-                    "ffmpeg",
-                    "-y",
+                    "ffmpeg", "-y",
                     *input_args,
                     "-filter_complex", filter_complex,
                     "-map", "[vout]",
                     "-map", "[a]",
                     "-c:v", codec,
-                    "-preset", preset,
-                    "-crf", str(cq),
-                    "-b:v", bitrate,
-                    "-c:a", audio_codec,
-                    "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    "-f", ext,
-                    out_file,
+                    "-preset", preset_to_use
                 ]
+
+                if preset_to_use in ['fast', 'faster', 'veryfast', 'superfast', 'ultrafast', "default", "llhp", "ll", "hp"]:
+                    cmd.extend([
+                        "-b:v", str(bitrate_value),
+                        "-maxrate", str(bitrate_value * 2),
+                        "-bufsize", str(bitrate_value * 4),
+                        "-c:a", audio_codec,
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        "-f", ext,
+                        out_file,
+                    ])
+                else:
+                    cmd.extend([
+                        "-crf", str(cq),
+                        "-b:v", str(bitrate_value),
+                        "-c:a", audio_codec,
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        "-f", ext,
+                        out_file,
+                    ])
+
                 input_for_duration = vobs[0]
             else:
                 self.append_log(f"Processing single file: {original_path}\n")
+
                 cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    original_path,
-                    "-c:v",
-                    codec,
-                    "-preset",
-                    preset,
-                    "-crf",
-                    str(cq),
-                    "-b:v",
-                    bitrate,
-                    "-vf",
-                    vf,
-                    "-c:a",
-                    audio_codec,
-                    "-b:a",
-                    "192k",
-                    "-movflags",
-                    "+faststart",
-                    "-f",
-                    ext,
-                    out_file,
+                    "ffmpeg", "-y",
+                    "-i", original_path,
+                    "-c:v", codec,
+                    "-preset", preset_to_use,
                 ]
+
+                if preset_to_use in ['fast', 'faster', 'veryfast', 'superfast', 'ultrafast', "default", "llhp", "ll", "hp"]:
+                    cmd.extend([
+                        "-b:v", str(bitrate_value),
+                        "-maxrate", str(bitrate_value * 2),
+                        "-bufsize", str(bitrate_value * 4),
+                        "-c:a", audio_codec,
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        "-f", ext,
+                        out_file,
+                    ])
+                else:
+                    cmd.extend([
+                        "-crf", str(cq),
+                        "-b:v", str(bitrate_value),
+                        "-vf", vf,
+                        "-c:a", audio_codec,
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        "-f", ext,
+                        out_file,
+                    ])
+
                 input_for_duration = original_path
 
             self.run_ffmpeg(cmd, input_for_duration)
@@ -573,13 +605,16 @@ class FFmpegGUI(Gtk.Window):
     def update_progress(self, fraction):
         self.progressbar.set_fraction(fraction)
         self.progressbar.set_text(f"{int(fraction * 100)}%")
+        while Gtk.events_pending():
+            Gtk.main_iteration()
         return False
 
     def reset_ui(self):
         self.process = None
         self.btn_convert.set_sensitive(True)
-        self.btn_cancel.set_sensitive(False)
         self.btn_convert.set_label("Convert")
+        while Gtk.events_pending():
+            Gtk.main_iteration()
         return False
 
     def show_dialog(self):
@@ -600,13 +635,6 @@ class FFmpegGUI(Gtk.Window):
             return float(proc.stdout)
         except Exception:
             return 0
-
-    def on_cancel(self, widget):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            GLib.idle_add(self.append_log, "Conversion cancelled.\n")
-            self.process = None
-            GLib.idle_add(self.reset_ui)
 
     def on_donate_clicked(self, widget):
         url = "https://www.paypal.com/donate?business=rompstar@gmail.com&amount=5.00"
