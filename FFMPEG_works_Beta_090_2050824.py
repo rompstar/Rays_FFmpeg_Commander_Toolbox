@@ -8,14 +8,10 @@ import threading
 import re
 import webbrowser
 import signal
-import time
-import fcntl
-
 
 def load_style():
     css = b"""
-    /* your existing CSS unchanged */
-    window {
+    window, GtkWindow {
         background-color: #C0C0C0;
         font-family: monospace, 'Courier New', Courier, monospace;
         font-size: 10pt;
@@ -94,7 +90,6 @@ def load_style():
     Gtk.StyleContext.add_provider_for_screen(
         screen, style_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
     )
-
 
 class FFmpegGUI(Gtk.Window):
     VERSION = "0.9.0 Beta"
@@ -274,11 +269,6 @@ class FFmpegGUI(Gtk.Window):
         self.btn_convert.connect("clicked", self.on_convert)
         btn_box.pack_start(self.btn_convert, False, False, 0)
 
-        # Clear button
-        self.btn_clear = Gtk.Button(label="Clear Selection")
-        self.btn_clear.connect("clicked", self.on_clear_selection)
-        btn_box.pack_start(self.btn_clear, False, False, 0)
-
         # Donate button
         self.btn_donate = Gtk.Button(label="Donate (PayPal)- buy me a coffee!")
         self.btn_donate.set_name("donate-button")
@@ -303,6 +293,16 @@ class FFmpegGUI(Gtk.Window):
 
         self.show_all()
 
+    def reset_ui(self):
+        self.process = None
+        self.btn_convert.set_sensitive(True)
+        self.btn_convert.set_label("Convert")
+        self.label_selected.set_text("No files or folders selected")  # reset selection state
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        return False
+
+
     def append_log(self, text: str):
         def _append():
             end_iter = self.textbuffer.get_end_iter()
@@ -322,25 +322,37 @@ class FFmpegGUI(Gtk.Window):
             return None
 
     def on_choose_files(self, widget):
-        dialog = Gtk.FileChooserDialog(title="Select Files",
-                                       parent=self,
-                                       action=Gtk.FileChooserAction.OPEN)
+        dialog = Gtk.FileChooserDialog(
+            title="Select Files",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                    Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        )
         dialog.set_select_multiple(True)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                           Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
         response = dialog.run()
+        print(f"File chooser response: {response}")  # debug
         if response == Gtk.ResponseType.OK:
             files = dialog.get_filenames()
-            # Clear previous selection before adding new files
+            print(f"Files selected: {files}")  # debug
             self.batch_files.clear()
-            self.batch_files.extend(files)
-            self.label_selected.set_text(f"{len(self.batch_files)} files selected")
-            if not self.entry_output.get_text() and files:
-                first = files[0]
-                base = os.path.basename(first)
-                ext = self.get_combo_text(self.combo_format) or "mp4"
-                self.entry_output.set_text(f"{base}_converted.{ext}")
+            if files:
+                self.batch_files.extend(files)
+                self.label_selected.set_text(f"{len(self.batch_files)} files selected")
+                self.append_log(f"Selected files: {files}\n")
+                if not self.entry_output.get_text():
+                    first = files[0]
+                    base = os.path.basename(first)
+                    ext = self.get_combo_text(self.combo_format) or "mp4"
+                    self.entry_output.set_text(f"{base}_converted.{ext}")
+            else:
+                self.label_selected.set_text("No files selected.")
+                self.append_log("No files selected from dialog\n")
+        else:
+            self.append_log("File selection cancelled\n")
         dialog.destroy()
+
+
 
     def on_format_changed(self, combo):
         if self.entry_output.get_text():
@@ -387,7 +399,6 @@ class FFmpegGUI(Gtk.Window):
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             folders = dialog.get_filenames()
-            # Clear previous selections to avoid accumulation
             self.batch_files.clear()
             self.batch_files.extend(folders)
             self.label_selected.set_text(f"{len(self.batch_files)} folders selected")
@@ -478,7 +489,6 @@ class FFmpegGUI(Gtk.Window):
             else:
                 out_file = out_file_name
 
-            # Map NVENC presets if using NVENC codecs
             if codec in ["hevc_nvenc", "h264_nvenc"]:
                 preset_to_use = nvenc_presets_map.get(preset, "default")
             else:
@@ -512,7 +522,7 @@ class FFmpegGUI(Gtk.Window):
                     "-preset", preset_to_use
                 ]
 
-                if preset_to_use in ['fast', 'faster', 'veryfast', 'superfast', 'ultrafast', "default", "llhp", "ll", "hp"]:  # NVENC fast presets
+                if preset_to_use in ['fast', 'faster', 'veryfast', 'superfast', 'ultrafast', "default", "llhp", "ll", "hp"]:
                     cmd.extend([
                         "-b:v", str(bitrate_value),
                         "-maxrate", str(bitrate_value * 2),
@@ -545,7 +555,7 @@ class FFmpegGUI(Gtk.Window):
                     "-preset", preset_to_use,
                 ]
 
-                if preset_to_use in ['fast', 'faster', 'veryfast', 'superfast', 'ultrafast', "default", "llhp", "ll", "hp"]:  # NVENC fast presets
+                if preset_to_use in ['fast', 'faster', 'veryfast', 'superfast', 'ultrafast', "default", "llhp", "ll", "hp"]:
                     cmd.extend([
                         "-b:v", str(bitrate_value),
                         "-maxrate", str(bitrate_value * 2),
@@ -570,12 +580,10 @@ class FFmpegGUI(Gtk.Window):
 
                 input_for_duration = original_path
 
-            self.run_ffmpeg(cmd, input_for_duration)
+            self.run_ffmpeg(cmd, input_for_duration, out_file)
 
-        # Clear the selection after processing is complete
         self.batch_files.clear()
         GLib.idle_add(self.label_selected.set_text, "No files or folders selected")
-
         GLib.idle_add(self.reset_ui)
 
     def on_clear_selection(self, widget):
@@ -583,7 +591,7 @@ class FFmpegGUI(Gtk.Window):
         self.label_selected.set_text("No files or folders selected")
         self.append_log("Selection cleared by user\n")
 
-    def run_ffmpeg(self, cmd, input_file):
+    def run_ffmpeg(self, cmd, input_file, out_file):
         self.append_log("Running: " + " ".join(str(x) for x in cmd) + "\n\n")
         self.duration_seconds = self.get_duration(input_file)
         GLib.idle_add(self.progressbar.set_fraction, 0)
@@ -594,9 +602,9 @@ class FFmpegGUI(Gtk.Window):
             pattern = re.compile(r"time=(\d+):(\d+):(\d+).(\d+)")
             try:
                 process = subprocess.Popen(cmd,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           universal_newlines=True)
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        universal_newlines=True)
                 self.process = process
                 while True:
                     line = process.stderr.readline()
@@ -612,12 +620,12 @@ class FFmpegGUI(Gtk.Window):
                 ret = process.wait()
                 if ret == 0:
                     GLib.idle_add(self.append_log,
-                                  "\n✅ Conversion completed successfully.\n")
+                                "\n✅ Conversion completed successfully.\n")
                     GLib.idle_add(self.update_progress, 1)
-                    GLib.idle_add(self.show_dialog)
+                    GLib.idle_add(self.show_dialog, out_file)
                 else:
                     GLib.idle_add(self.append_log,
-                                  f"\n❌ Conversion failed (code {ret}).\n")
+                                f"\n❌ Conversion failed (code {ret}).\n")
                     GLib.idle_add(self.update_progress, 0)
             except Exception as e:
                 GLib.idle_add(self.append_log, f"\nError: {str(e)}\n")
@@ -625,6 +633,7 @@ class FFmpegGUI(Gtk.Window):
                 GLib.idle_add(self.reset_ui)
 
         threading.Thread(target=monitor, daemon=True).start()
+
 
     def update_progress(self, fraction):
         self.progressbar.set_fraction(fraction)
@@ -641,10 +650,15 @@ class FFmpegGUI(Gtk.Window):
             Gtk.main_iteration()
         return False
 
-    def show_dialog(self):
-        dlg = Gtk.MessageDialog(self, 0, Gtk.MessageType.INFO, Gtk.ButtonsType.OK,
-                                "Conversion Completed")
-        dlg.format_secondary_text("All videos processed successfully.")
+    def show_dialog(self, filename):
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=f"Conversion Completed: {filename}"
+        )
+        dlg.format_secondary_text("The video file was processed successfully.")
         dlg.run()
         dlg.destroy()
 
@@ -664,9 +678,15 @@ class FFmpegGUI(Gtk.Window):
         url = "https://www.paypal.com/donate?business=rompstar@gmail.com&amount=5.00"
         webbrowser.open(url)
 
+def signal_handler(sig, frame):
+    Gtk.main_quit()
 
-if __name__ == "__main__":
-    win = FFmpegGUI()
-    win.connect("destroy", Gtk.main_quit)
-    win.show_all()
+if __name__ == '__main__':
+    import signal
+    from gi.repository import Gtk
+
+    signal.signal(signal.SIGINT, signal_handler)
+    window = FFmpegGUI()
+    window.connect("delete-event", Gtk.main_quit)
+    window.show_all()
     Gtk.main()
