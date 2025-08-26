@@ -386,8 +386,8 @@ class FFmpegGUI(Gtk.Window):
         except Exception:
             nvenc = ["NVENC not detected"]
 
-        self.gpu_label.set_text("GPUs:\n" + "\n".join(gpus) + "\nNVENC:\n" +
-                               ", ".join(nvenc))
+        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " +
+                       ", ".join(nvenc))
 
     def on_choose_folders(self, widget):
         dialog = Gtk.FileChooserDialog(title="Select Folders",
