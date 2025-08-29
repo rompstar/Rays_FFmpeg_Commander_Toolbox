@@ -99,6 +99,7 @@ def load_style():
         screen, style_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
     )
 
+
 class FFmpegGUI(Gtk.Window):
     VERSION = "0.9.1 Beta"
 
@@ -109,6 +110,7 @@ class FFmpegGUI(Gtk.Window):
         self.set_default_size(1200, 900)
         self.set_resizable(True)
 
+        # Initialize important variables here without launching ffmpeg
         self.batch_files = []
         self.process = None
         self.duration_seconds = 0
@@ -443,138 +445,6 @@ class FFmpegGUI(Gtk.Window):
             return 0
 
     def process_batch(self):
-        # Placeholder for codec preset mapping and batch processing logic as needed
-        self.append_log(f"Starting batch of {len(self.batch_files)} items\n")
-        for idx, path in enumerate(self.batch_files):
-            self.append_log(f"Processing item {idx + 1}: {path}\n")
-            # Add your existing batch processing code here
-            # Including calling self.run_ffmpeg(...)
-        GLib.idle_add(self.reset_ui)
-
-    def run_ffmpeg(self, cmd, input_file):
-        self.append_log("Running: " + " ".join(str(x) for x in cmd) + "\n\n")
-        self.duration_seconds = self.get_duration(input_file)
-        GLib.idle_add(self.progressbar.set_fraction, 0)
-        GLib.idle_add(self.progressbar.set_text, "0%")
-        GLib.idle_add(self.progressbar.set_show_text, True)
-
-        def monitor():
-            pattern = re.compile(r"time=(\d+):(\d+):(\d+).(\d+)")
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    bufsize=1,
-                )
-                self.process = process
-                for line in iter(process.stderr.readline, ''):
-                    if not line:
-                        break
-                    GLib.idle_add(self.append_log, line)
-                    m = pattern.search(line)
-                    if m and self.duration_seconds:
-                        h, m_, s, cs = map(int, m.groups())
-                        elapsed = h * 3600 + m_ * 60 + s + cs / 100
-                        progress = min(elapsed / self.duration_seconds, 1.0)
-                        GLib.idle_add(self.update_progress, progress)
-                ret = process.wait()
-                if ret == 0:
-                    GLib.idle_add(self.append_log,
-                                    "\n✅ Conversion completed successfully.\n")
-                    GLib.idle_add(self.update_progress, 1.0)
-                    GLib.idle_add(self.show_dialog)
-                else:
-                    GLib.idle_add(self.append_log,
-                                    f"\n❌ Conversion failed (code {ret}).\n")
-                    GLib.idle_add(self.update_progress, 0.0)
-            except Exception as e:
-                GLib.idle_add(self.append_log, f"\nError: {str(e)}\n")
-            finally:
-                GLib.idle_add(self.reset_ui)
-
-        threading.Thread(target=monitor, daemon=True).start()
-
-    def update_progress(self, fraction):
-        self.progressbar.set_fraction(fraction)
-        self.progressbar.set_text(f"{int(fraction * 100)}%")
-        while Gtk.events_pending():
-            Gtk.main_iteration()
-        return False
-
-    def show_dialog(self, filename=""):
-        dlg = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            destroy_with_parent=True,
-            message_type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            text=f"Conversion Completed: {filename}"
-        )
-        dlg.format_secondary_text("The video file was processed successfully.")
-        dlg.run()
-        dlg.destroy()
-
-    def update_gpu_info(self):
-        self.gpu_label.set_text("Detecting hardware...")
-        GLib.idle_add(self._detect_gpu)
-
-    def _detect_gpu(self):
-        try:
-            output = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                text=True)
-            gpus = output.strip().splitlines()
-        except Exception:
-            gpus = ["Nvidia not found"]
-
-        try:
-            output = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"],
-                                             text=True)
-            nvenc = []
-            if "h264_nvenc" in output:
-                nvenc.append("h264_nvenc")
-            if "hevc_nvenc" in output:
-                nvenc.append("hevc_nvenc")
-        except Exception:
-            nvenc = ["NVENC not detected"]
-
-        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " +
-                                ", ".join(nvenc))
-
-    def reset_ui(self):
-        self.process = None
-        self.btn_convert.set_sensitive(True)
-        self.btn_cancel.set_sensitive(False)
-        self.btn_convert.set_label("Convert")
-        self.label_selected.set_text("No files or folders selected")
-        while Gtk.events_pending():
-            Gtk.main_iteration()
-        return False
-
-    def on_format_changed(self, combo):
-        if self.entry_output.get_text():
-            base = self.entry_output.get_text()
-            if "." in base:
-                base = base.rsplit(".", 1)[0]
-            ext = self.get_combo_text(combo) or "mp4"
-            self.entry_output.set_text(f"{base}.{ext}")
-
-    def show_dialog(self, filename=""):
-        dlg = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            destroy_with_parent=True,
-            message_type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            text=f"Conversion Completed: {filename}"
-        )
-        dlg.format_secondary_text("The video file was processed successfully.")
-        dlg.run()
-        dlg.destroy()
-
-    def process_batch(self):
         nvenc_presets_map = {
             "ultrafast": "default",
             "superfast": "llhp",
@@ -713,15 +583,123 @@ class FFmpegGUI(Gtk.Window):
 
                 input_for_duration = original_path
 
-            self.run_ffmpeg(cmd, input_for_duration)
+            # Run ffmpeg synchronously here sequentially
+            self.run_ffmpeg_sync(cmd, input_for_duration)
 
         self.batch_files.clear()
         GLib.idle_add(self.label_selected.set_text, "No files or folders selected")
         GLib.idle_add(self.reset_ui)
 
-if __name__ == "__main__":
-    import signal
+    def run_ffmpeg_sync(self, cmd, input_file):
+        self.append_log("Running: " + " ".join(cmd) + "\n\n")
+        self.duration_seconds = self.get_duration(input_file)
+        GLib.idle_add(self.progressbar.set_fraction, 0)
+        GLib.idle_add(self.progressbar.set_text, "0%")
+        GLib.idle_add(self.progressbar.set_show_text, True)
 
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1,
+            )
+            self.process = process
+
+            pattern = re.compile(r"time=(\d+):(\d+):(\d+).(\d+)")
+            for line in iter(process.stderr.readline, ''):
+                if not line:
+                    break
+                GLib.idle_add(self.append_log, line)
+                m = pattern.search(line)
+                if m and self.duration_seconds:
+                    h, m_, s, cs = map(int, m.groups())
+                    elapsed = h * 3600 + m_ * 60 + s + cs / 100
+                    progress = min(elapsed / self.duration_seconds, 1.0)
+                    GLib.idle_add(self.update_progress, progress)
+
+            ret = process.wait()
+            if ret == 0:
+                GLib.idle_add(self.append_log, "\n✅ Conversion completed successfully.\n")
+                GLib.idle_add(self.update_progress, 1.0)
+                GLib.idle_add(self.show_dialog)
+            else:
+                GLib.idle_add(self.append_log, f"\n❌ Conversion failed (code {ret}).\n")
+                GLib.idle_add(self.update_progress, 0.0)
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"\nError: {str(e)}\n")
+        finally:
+            GLib.idle_add(self.reset_ui)
+            self.process = None
+
+    def update_progress(self, fraction):
+        self.progressbar.set_fraction(fraction)
+        self.progressbar.set_text(f"{int(fraction * 100)}%")
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        return False
+
+    def show_dialog(self, filename=""):
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            destroy_with_parent=True,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=f"Conversion Completed: {filename}"
+        )
+        dlg.format_secondary_text("The video file was processed successfully.")
+        dlg.run()
+        dlg.destroy()
+
+    def update_gpu_info(self):
+        self.gpu_label.set_text("Detecting hardware...")
+        GLib.idle_add(self._detect_gpu)
+
+    def _detect_gpu(self):
+        try:
+            output = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                text=True)
+            gpus = output.strip().splitlines()
+        except Exception:
+            gpus = ["Nvidia not found"]
+
+        try:
+            output = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"],
+                                             text=True)
+            nvenc = []
+            if "h264_nvenc" in output:
+                nvenc.append("h264_nvenc")
+            if "hevc_nvenc" in output:
+                nvenc.append("hevc_nvenc")
+        except Exception:
+            nvenc = ["NVENC not detected"]
+
+        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " +
+                                ", ".join(nvenc))
+
+    def reset_ui(self):
+        self.process = None
+        self.btn_convert.set_sensitive(True)
+        self.btn_cancel.set_sensitive(False)
+        self.btn_convert.set_label("Convert")
+        self.label_selected.set_text("No files or folders selected")
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        return False
+
+    def on_format_changed(self, combo):
+        if self.entry_output.get_text():
+            base = self.entry_output.get_text()
+            if "." in base:
+                base = base.rsplit(".", 1)[0]
+            ext = self.get_combo_text(combo) or "mp4"
+            self.entry_output.set_text(f"{base}.{ext}")
+
+
+if __name__ == "__main__":
     def signal_handler(sig, frame):
         Gtk.main_quit()
 
@@ -730,9 +708,3 @@ if __name__ == "__main__":
     window.connect("destroy", Gtk.main_quit)
     window.show_all()
     Gtk.main()
-
-
-
-
-
-
