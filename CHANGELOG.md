@@ -4,6 +4,7 @@
 ### Added
 - Implemented a Progress bar update
 - Added a Clear Selection button
+- Fixed the Cancel Button
 
 ### Fixed
 - Resolved indentation errors.
