@@ -1,6 +1,3 @@
-Here is your changelog text reformatted for clarity and standard Markdown best practices. Duplicate entries and section confusion have been resolved, bullet points are standardized, version headers are clear, and features/fixes are grouped with appropriate spacing.[1]
-
-***
 
 # Changelog
 
