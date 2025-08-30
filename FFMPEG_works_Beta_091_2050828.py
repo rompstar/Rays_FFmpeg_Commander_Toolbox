@@ -113,6 +113,7 @@ class FFmpegGUI(Gtk.Window):
         self.batch_files = []  
         self.process = None  
         self.duration_seconds = 0  
+        self.cancel_requested = False  
   
         load_style()  
   
@@ -466,17 +467,40 @@ class FFmpegGUI(Gtk.Window):
         if not self.batch_files:  
             self.label_selected.set_text("No files or folders selected.")  
             return  
+        self.cancel_requested = False  # clear cancel flag  
         self.btn_convert.set_sensitive(False)  
         self.btn_cancel.set_sensitive(True)  
         self.btn_convert.set_label("Converting...")  
         threading.Thread(target=self.process_batch, daemon=True).start()  
   
+    def _spawn_kwargs(self):  
+        # Ensure ffmpeg runs in its own process group so we can terminate it cleanly  
+        if os.name == 'posix':  
+            return {'preexec_fn': os.setsid}  
+        elif os.name == 'nt':  
+            return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}  
+        return {}  
+  
+    def _terminate_current_ffmpeg(self, force=False):  
+        p = self.process  
+        if not p or p.poll() is not None:  
+            return  
+        try:  
+            if os.name == 'posix':  
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL if force else signal.SIGTERM)  
+            else:  
+                if force:  
+                    p.kill()  
+                else:  
+                    p.terminate()  
+        except Exception:  
+            pass  
+  
     def on_cancel(self, widget):  
-        if self.process and self.process.poll() is None:  
-            self.process.terminate()  
-            GLib.idle_add(self.append_log, "Conversion cancelled.\n")  
-            self.process = None  
-            GLib.idle_add(self.reset_ui)  
+        self.cancel_requested = True  
+        self.append_log("Cancellation requested…\n")  
+        self._terminate_current_ffmpeg()  
+        # Do not reset UI here; the worker thread will exit and reset once.  
   
     def on_donate_clicked(self, widget):  
         url = "https://www.paypal.com/donate?business=rompstar@gmail.com&amount=5.00"  
@@ -520,6 +544,9 @@ class FFmpegGUI(Gtk.Window):
   
         self.append_log(f"Starting batch of {len(self.batch_files)} items\n")  
         for idx, path in enumerate(self.batch_files):  
+            if self.cancel_requested:  
+                break  
+  
             self.append_log(f"Processing item {idx + 1}: {path}\n")  
             original_path = path  
             work_path = os.path.dirname(path) if os.path.basename(path).upper() == "VIDEO_TS" else path  
@@ -529,7 +556,7 @@ class FFmpegGUI(Gtk.Window):
             bitrate = self.entry_bitrate.get_text()  
             if not bitrate.isdigit():  
                 GLib.idle_add(self.label_selected.set_text, "Bitrate must be numeric")  
-                return  
+                break  
             bitrate_value = int(bitrate)  
   
             cq = int(self.scale_cq.get_value())  
@@ -656,7 +683,14 @@ class FFmpegGUI(Gtk.Window):
             # Run ffmpeg synchronously here sequentially  
             self.run_ffmpeg_sync(cmd, input_for_duration)  
   
+            if self.cancel_requested:  
+                break  
+  
         self.batch_files.clear()  
+        if self.cancel_requested:  
+            self.append_log("Batch cancelled. No more files will be processed.\n")  
+        else:  
+            self.append_log("Batch finished.\n")  
         GLib.idle_add(self.label_selected.set_text, "No files or folders selected")  
         GLib.idle_add(self.reset_ui)  
   
@@ -674,14 +708,20 @@ class FFmpegGUI(Gtk.Window):
                 stderr=subprocess.PIPE,  
                 universal_newlines=True,  
                 bufsize=1,  
+                **self._spawn_kwargs()  
             )  
             self.process = process  
   
-            pattern = re.compile(r"time=(\d+):(\d+):(\d+).(\d+)")  
+            pattern = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")  
             for line in iter(process.stderr.readline, ''):  
                 if not line:  
                     break  
                 GLib.idle_add(self.append_log, line)  
+  
+                if self.cancel_requested:  
+                    self._terminate_current_ffmpeg()  
+                    break  
+  
                 m = pattern.search(line)  
                 if m and self.duration_seconds:  
                     h, m_, s, cs = map(int, m.groups())  
@@ -690,6 +730,11 @@ class FFmpegGUI(Gtk.Window):
                     GLib.idle_add(self.update_progress, progress)  
   
             ret = process.wait()  
+  
+            if self.cancel_requested:  
+                self.append_log("\n🛑 Cancelled by user.\n")  
+                return  
+  
             if ret == 0:  
                 GLib.idle_add(self.append_log, "\n✅ Conversion completed successfully.\n")  
                 GLib.idle_add(self.update_progress, 1.0)  
@@ -700,7 +745,7 @@ class FFmpegGUI(Gtk.Window):
         except Exception as e:  
             GLib.idle_add(self.append_log, f"\nError: {str(e)}\n")  
         finally:  
-            GLib.idle_add(self.reset_ui)  
+            # Do NOT reset the UI here; the batch thread will do it once.  
             self.process = None  
   
     def update_progress(self, fraction):  
