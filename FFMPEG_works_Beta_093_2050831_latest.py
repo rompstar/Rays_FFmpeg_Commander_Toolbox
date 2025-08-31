@@ -1,6 +1,6 @@
-# ffmpeg_commander.py — v0.9.3  
-# Note: This is the full program in one block. Window styling is unchanged.  
-# Adds “Super Convert” with faster, visually‑transparent x265 settings and better CPU scaling.  
+# ffmpeg_commander.py — v0.9.4  
+# Full program in one block. Original retro/light window style is preserved.  
+# Super Convert now prefers GPU (NVENC) automatically for ≥25 fps, with CPU fallback.  
   
 import gi  
 gi.require_version('Gtk', '3.0')  
@@ -15,7 +15,7 @@ import signal
 import json  
   
 def load_style():  
-    # Original light/retro style kept as-is (per your request)  
+    # Keep original style (do not change app appearance)  
     css = b"""  
     window, GtkWindow {  
         background-color: #C0C0C0;  
@@ -102,7 +102,7 @@ def load_style():
     )  
   
 class FFmpegGUI(Gtk.Window):  
-    VERSION = "0.9.3"  
+    VERSION = "0.9.4"  
   
     def __init__(self):  
         super().__init__(title=f"Ray’s FFmpeg Commander Toolbox - v{self.VERSION} Beta")  
@@ -125,12 +125,13 @@ class FFmpegGUI(Gtk.Window):
         self.current_item_duration = 0.0  
         self.last_speed = 1.0  
   
-        # NVENC availability  
-        self._nvenc_available = set()  
+        # Hardware availability  
+        self._nvenc_available = set()  # {'h264_nvenc','hevc_nvenc'}  
+        self._have_cuda_hwaccel = False  
   
         # Super Convert helpers  
-        self._super_bit_depth = None     # desired encode bit depth when Super is used  
-        self._super_x265_params = None   # extra x265 params for speed scaling  
+        self._super_bit_depth = None  
+        self._super_x265_params = None  
   
         load_style()  
   
@@ -159,17 +160,13 @@ class FFmpegGUI(Gtk.Window):
         self.label_selected = Gtk.Label(label="No files or folders selected", xalign=0)  
         vbox.pack_start(self.label_selected, False, False, 0)  
   
-        # Batch status  
         self.label_batch_status = Gtk.Label(label="", xalign=0)  
         vbox.pack_start(self.label_batch_status, False, False, 0)  
   
         # Output naming  
         out_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(out_box, False, False, 0)  
-  
-        out_label = Gtk.Label(label="Output filename (suffix added automatically)", xalign=0)  
-        out_box.pack_start(out_label, False, False, 0)  
-  
+        out_box.pack_start(Gtk.Label(label="Output filename (suffix added automatically)", xalign=0), False, False, 0)  
         self.entry_output = Gtk.Entry()  
         self.entry_output.set_hexpand(True)  
         out_box.pack_start(self.entry_output, False, False, 0)  
@@ -177,13 +174,7 @@ class FFmpegGUI(Gtk.Window):
         # Container  
         format_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(format_box, False, False, 0)  
-  
-        format_label = Gtk.Label(  
-            label="Container (file format for the output file: mp4, mkv, mov, avi, webm).",  
-            xalign=0  
-        )  
-        format_box.pack_start(format_label, False, False, 0)  
-  
+        format_box.pack_start(Gtk.Label(label="Container (file format for the output file: mp4, mkv, mov, avi, webm).", xalign=0), False, False, 0)  
         self.store_format = Gtk.ListStore(str)  
         for fmt in ['mp4', 'mkv', 'mov', 'avi', 'webm']:  
             self.store_format.append([fmt])  
@@ -191,7 +182,7 @@ class FFmpegGUI(Gtk.Window):
         renderer = Gtk.CellRendererText()  
         self.combo_format.pack_start(renderer, True)  
         self.combo_format.add_attribute(renderer, "text", 0)  
-        self.combo_format.set_active(0)  # mp4  
+        self.combo_format.set_active(0)  
         self.combo_format.set_hexpand(True)  
         self.combo_format.connect("changed", self.on_format_changed)  
         format_box.pack_start(self.combo_format, False, False, 0)  
@@ -199,15 +190,9 @@ class FFmpegGUI(Gtk.Window):
         # Video encoder  
         codec_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(codec_box, False, False, 0)  
-  
-        codec_label = Gtk.Label(  
-            label="Video encoder (codec implementation used by FFmpeg to produce the video stream).",  
-            xalign=0  
-        )  
-        codec_box.pack_start(codec_label, False, False, 0)  
-  
-        self.store_codec = Gtk.ListStore(str, str)  # display text, ffmpeg name  
-        codec_items = [  
+        codec_box.pack_start(Gtk.Label(label="Video encoder (codec implementation used by FFmpeg to produce the video stream).", xalign=0), False, False, 0)  
+        self.store_codec = Gtk.ListStore(str, str)  
+        for disp, enc in [  
             ("H.264 / AVC (libx264 – CPU)", "libx264"),  
             ("H.265 / HEVC (libx265 – CPU)", "libx265"),  
             ("H.264 / AVC (NVENC – NVIDIA GPU)", "h264_nvenc"),  
@@ -215,8 +200,7 @@ class FFmpegGUI(Gtk.Window):
             ("VP8 (libvpx)", "libvpx"),  
             ("VP9 (libvpx-vp9)", "libvpx-vp9"),  
             ("Motion JPEG (mjpeg)", "mjpeg"),  
-        ]  
-        for disp, enc in codec_items:  
+        ]:  
             self.store_codec.append([disp, enc])  
         self.combo_codec = Gtk.ComboBox.new_with_model(self.store_codec)  
         renderer2 = Gtk.CellRendererText()  
@@ -229,32 +213,22 @@ class FFmpegGUI(Gtk.Window):
         # Preset  
         preset_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(preset_box, False, False, 0)  
-  
-        preset_label = Gtk.Label(  
-            label="Preset (speed/quality trade‑off; x264/x265 and NVENC).",  
-            xalign=0  
-        )  
-        preset_box.pack_start(preset_label, False, False, 0)  
-  
+        preset_box.pack_start(Gtk.Label(label="Preset (speed/quality trade‑off; x264/x265 and NVENC).", xalign=0), False, False, 0)  
         self.store_preset = Gtk.ListStore(str)  
-        for p in ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast',  
-                  'medium', 'slow', 'slower', 'veryslow', 'placebo']:  
+        for p in ['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow','placebo']:  
             self.store_preset.append([p])  
         self.combo_preset = Gtk.ComboBox.new_with_model(self.store_preset)  
         renderer3 = Gtk.CellRendererText()  
         self.combo_preset.pack_start(renderer3, True)  
         self.combo_preset.add_attribute(renderer3, "text", 0)  
-        self.combo_preset.set_active(5)  # medium  
+        self.combo_preset.set_active(5)  
         self.combo_preset.set_hexpand(True)  
         preset_box.pack_start(self.combo_preset, False, False, 0)  
   
         # Rate control (NVENC only)  
         rc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(rc_box, False, False, 0)  
-  
-        rc_label = Gtk.Label(label="Rate control (NVENC only here): VBR or CBR.", xalign=0)  
-        rc_box.pack_start(rc_label, False, False, 0)  
-  
+        rc_box.pack_start(Gtk.Label(label="Rate control (NVENC only here): VBR or CBR.", xalign=0), False, False, 0)  
         self.store_rc = Gtk.ListStore(str)  
         for rc in ['vbr', 'cbr']:  
             self.store_rc.append([rc])  
@@ -262,17 +236,15 @@ class FFmpegGUI(Gtk.Window):
         renderer4 = Gtk.CellRendererText()  
         self.combo_rc.pack_start(renderer4, True)  
         self.combo_rc.add_attribute(renderer4, "text", 0)  
-        self.combo_rc.set_active(0)  # vbr  
+        self.combo_rc.set_active(0)  
         self.combo_rc.set_hexpand(True)  
         rc_box.pack_start(self.combo_rc, False, False, 0)  
   
         # Quality slider  
         cq_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(cq_box, False, False, 0)  
-  
         self.cq_label = Gtk.Label(label="Quality (CRF/CQ 0–51; lower = higher quality)", xalign=0)  
         cq_box.pack_start(self.cq_label, False, False, 0)  
-  
         self.adj_cq = Gtk.Adjustment(value=23, lower=0, upper=51, step_increment=1)  
         self.scale_cq = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.adj_cq)  
         self.scale_cq.set_digits(0)  
@@ -283,10 +255,7 @@ class FFmpegGUI(Gtk.Window):
         # Bitrate  
         bitrate_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(bitrate_box, False, False, 0)  
-  
-        bitrate_label = Gtk.Label(label="Bitrate (kbps) - set 0 for quality-based", xalign=0)  
-        bitrate_box.pack_start(bitrate_label, False, False, 0)  
-  
+        bitrate_box.pack_start(Gtk.Label(label="Bitrate (kbps) - set 0 for quality-based", xalign=0), False, False, 0)  
         self.entry_bitrate = Gtk.Entry()  
         self.entry_bitrate.set_text("0")  
         self.entry_bitrate.set_hexpand(True)  
@@ -301,18 +270,12 @@ class FFmpegGUI(Gtk.Window):
         self.chk_bw.set_active(False)  
         vbox.pack_start(self.chk_bw, False, False, 0)  
   
-        # Audio encoder  
+        # Audio  
         audio_codec_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)  
         vbox.pack_start(audio_codec_box, False, False, 0)  
-  
-        audio_codec_label = Gtk.Label(label="Audio encoder", xalign=0)  
-        audio_codec_box.pack_start(audio_codec_label, False, False, 0)  
-  
+        audio_codec_box.pack_start(Gtk.Label(label="Audio encoder", xalign=0), False, False, 0)  
         self.store_audio_codec = Gtk.ListStore(str, str)  
-        for disp, enc in [("AAC (aac)", "aac"),  
-                          ("MP3 (libmp3lame)", "libmp3lame"),  
-                          ("Opus (libopus)", "libopus"),  
-                          ("AC-3 (ac3)", "ac3")]:  
+        for disp, enc in [("AAC (aac)", "aac"), ("MP3 (libmp3lame)", "libmp3lame"), ("Opus (libopus)", "libopus"), ("AC-3 (ac3)", "ac3")]:  
             self.store_audio_codec.append([disp, enc])  
         self.combo_audio_codec = Gtk.ComboBox.new_with_model(self.store_audio_codec)  
         renderer_audio = Gtk.CellRendererText()  
@@ -322,7 +285,7 @@ class FFmpegGUI(Gtk.Window):
         self.combo_audio_codec.set_hexpand(True)  
         audio_codec_box.pack_start(self.combo_audio_codec, False, False, 0)  
   
-        # Buttons row  
+        # Buttons  
         btn_box = Gtk.Box(spacing=6)  
         vbox.pack_start(btn_box, False, False, 0)  
   
@@ -330,7 +293,6 @@ class FFmpegGUI(Gtk.Window):
         self.btn_convert.connect("clicked", self.on_convert)  
         btn_box.pack_start(self.btn_convert, False, False, 0)  
   
-        # Super Convert (to the right of Convert)  
         self.btn_super = Gtk.Button(label="Super Convert")  
         self.btn_super.connect("clicked", self.on_super_convert)  
         btn_box.pack_start(self.btn_super, False, False, 0)  
@@ -345,16 +307,15 @@ class FFmpegGUI(Gtk.Window):
         self.btn_donate.connect("clicked", self.on_donate_clicked)  
         btn_box.pack_start(self.btn_donate, False, False, 0)  
   
-        # Info label: Convert vs Super Convert  
+        # Info label explaining modes  
         info = ("Convert = use the settings above.  "  
-                "Super Convert = optimized for speed + size while staying visually transparent "  
-                "(MP4 + HEVC/x265, faster preset by resolution, CRF tuned, parallel search; "  
-                "10‑bit only when source is 10/12‑bit).")  
+                "Super Convert = auto‑optimized for ≥25 fps using GPU (NVENC) if available, "  
+                "with quality‑based VBR; falls back to fast x265 on CPU.")  
         self.label_modes = Gtk.Label(label=info, xalign=0)  
         self.label_modes.set_line_wrap(True)  
         vbox.pack_start(self.label_modes, False, False, 0)  
   
-        # Output view  
+        # Log/Output  
         self.textbuffer = Gtk.TextBuffer()  
         self.textview = Gtk.TextView(buffer=self.textbuffer)  
         self.textview.set_editable(False)  
@@ -362,7 +323,6 @@ class FFmpegGUI(Gtk.Window):
         self.textview.set_monospace(True)  
         self.textview.set_vexpand(True)  
         self.textview.set_hexpand(True)  
-  
         scroll = Gtk.ScrolledWindow()  
         scroll.add(self.textview)  
         scroll.set_vexpand(True)  
@@ -370,13 +330,11 @@ class FFmpegGUI(Gtk.Window):
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)  
         vbox.pack_start(scroll, True, True, 0)  
   
-        # ETA labels  
+        # ETA + progress  
         self.label_file_eta = Gtk.Label(label="File ETA: —", xalign=0)  
         vbox.pack_start(self.label_file_eta, False, False, 0)  
-  
         self.label_eta = Gtk.Label(label="Overall ETA: —", xalign=0)  
         vbox.pack_start(self.label_eta, False, False, 0)  
-  
         self.progressbar = Gtk.ProgressBar()  
         self.progressbar.set_size_request(-1, 40)  
         vbox.pack_start(self.progressbar, False, False, 0)  
@@ -386,7 +344,7 @@ class FFmpegGUI(Gtk.Window):
   
         self.show_all()  
   
-    # ---------------- UI helpers ----------------  
+    # ----------------- UI helpers -----------------  
   
     def append_log(self, text: str):  
         def _append():  
@@ -430,8 +388,7 @@ class FFmpegGUI(Gtk.Window):
   
     def on_choose_files(self, widget):  
         dialog = Gtk.FileChooserDialog(title="Select Files", parent=self, action=Gtk.FileChooserAction.OPEN)  
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,  
-                           Gtk.STOCK_OPEN, Gtk.ResponseType.OK)  
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)  
         dialog.set_select_multiple(True)  
         response = dialog.run()  
         if response == Gtk.ResponseType.OK:  
@@ -442,8 +399,7 @@ class FFmpegGUI(Gtk.Window):
                 self.label_selected.set_text(f"{len(self.batch_files)} files selected")  
                 self.append_log(f"Selected files: {files}\n")  
                 if not self.entry_output.get_text():  
-                    first = files[0]  
-                    base = os.path.basename(first)  
+                    base = os.path.basename(files[0])  
                     ext = self.get_combo_text(self.combo_format) or "mp4"  
                     self.entry_output.set_text(f"{base}_converted.{ext}")  
             else:  
@@ -455,8 +411,7 @@ class FFmpegGUI(Gtk.Window):
   
     def on_choose_folders(self, widget):  
         dialog = Gtk.FileChooserDialog(title="Select Folders", parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)  
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,  
-                           Gtk.STOCK_OPEN, Gtk.ResponseType.OK)  
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)  
         dialog.set_select_multiple(True)  
         response = dialog.run()  
         if response == Gtk.ResponseType.OK:  
@@ -491,16 +446,15 @@ class FFmpegGUI(Gtk.Window):
         self.label_selected.set_text("No files or folders selected")  
         self.append_log("Selection cleared by user\n")  
   
-    # ---------------- Super Convert ----------------  
+    # ----------------- Super Convert -----------------  
   
     def _x265_speed_params(self, ultra=False, add_no_sao=False):  
-        # Build x265 param string that scales to many cores with minimal visual impact  
         ncpu = os.cpu_count() or 8  
         frame_threads = 4 if ncpu >= 16 else 3  
         lookahead = 12 if ultra else 15  
         parts = [  
-            "pmode=1",          # parallel mode decision  
-            "pme=1",            # parallel motion estimation  
+            "pmode=1",  
+            "pme=1",  
             f"frame-threads={frame_threads}",  
             "pools=full",  
             f"rc-lookahead={lookahead}",  
@@ -528,35 +482,73 @@ class FFmpegGUI(Gtk.Window):
             return {"codec": None, "bit_rate": 0, "w": 0, "h": 0, "pix_fmt": ""}  
   
     def choose_super_settings(self, info):  
-        # Faster presets by resolution with small CRF offsets to keep size/quality balanced  
+        # Prefer GPU first for speed ≥25 fps  
+        use_hevc_nvenc = "hevc_nvenc" in self._nvenc_available  
+        use_h264_nvenc = "h264_nvenc" in self._nvenc_available  
+  
         h = int(info.get("h") or 0)  
-        if h >= 2000:            # 4K  
-            preset = "fast"  
-            crf = 24  
-            xparams = self._x265_speed_params(ultra=True, add_no_sao=True)  # push harder for 4K  
-        elif h >= 1000:          # 1080–1440p  
-            preset = "medium"  
-            crf = 25  
-            xparams = self._x265_speed_params()  
-        elif h >= 700:           # 720p  
-            preset = "medium"  
-            crf = 27  
-            xparams = self._x265_speed_params()  
-        else:                    # SD  
-            preset = "fast"  
-            crf = 29  
-            xparams = self._x265_speed_params()  
-        # Prefer 10-bit only when the source is 10/12-bit; otherwise 8-bit for speed  
+  
+        if use_hevc_nvenc or use_h264_nvenc:  
+            codec = "hevc_nvenc" if use_hevc_nvenc else "h264_nvenc"  
+  
+            # CQ tuned by resolution (lower = higher quality)  
+            if h >= 2160:  
+                cq = 20 if codec == "hevc_nvenc" else 18  
+                preset = "slow"   # maps to p6  
+            elif h >= 1440:  
+                cq = 21 if codec == "hevc_nvenc" else 19  
+                preset = "slow"  
+            elif h >= 1080:  
+                cq = 22 if codec == "hevc_nvenc" else 20  
+                preset = "slow"  
+            elif h >= 720:  
+                cq = 24 if codec == "hevc_nvenc" else 22  
+                preset = "medium" # maps to p5  
+            else:  
+                cq = 26 if codec == "hevc_nvenc" else 24  
+                preset = "medium"  
+  
+            # HEVC 10‑bit when source is 10/12‑bit; otherwise 8‑bit  
+            bit_depth = 10 if (codec == "hevc_nvenc" and re.search(r"10|12", info.get("pix_fmt",""))) else 8  
+            return {  
+                "codec": codec,  
+                "preset": preset,  
+                "crf_or_cq": cq,  
+                "bit_depth": bit_depth,  
+                "rc_mode": "vbr",  
+                "use_gpu": True  
+            }  
+  
+        # CPU fallback (x265 fast/medium with parallel params)  
+        if h >= 2000:  
+            preset = "fast"; crf = 24; ultra = True  
+        elif h >= 1000:  
+            preset = "medium"; crf = 25; ultra = False  
+        elif h >= 700:  
+            preset = "medium"; crf = 27; ultra = False  
+        else:  
+            preset = "fast"; crf = 29; ultra = False  
+  
         bit_depth = 10 if re.search(r"10|12", info.get("pix_fmt","")) else 8  
-        return {"codec":"libx265","preset":preset,"crf":crf,"bit_depth":bit_depth,"x265_params":xparams}  
+        return {  
+            "codec": "libx265",  
+            "preset": preset,  
+            "crf_or_cq": crf,  
+            "bit_depth": bit_depth,  
+            "x265_params": self._x265_speed_params(ultra=ultra, add_no_sao=True),  
+            "rc_mode": "crf",  
+            "use_gpu": False  
+        }  
   
     def on_super_convert(self, _):  
         if not self.batch_files:  
             self.label_selected.set_text("No files or folders selected.")  
             return  
-        # Super Convert forces MP4 container for broad compatibility  
+  
+        # Force MP4 for compatibility  
         self.combo_format.set_active(0)  # mp4  
-        # Probe first item (or first VOB inside VIDEO_TS) to guide settings  
+  
+        # Probe first file (or first VOB)  
         first = self.batch_files[0]  
         probe_target = first  
         if self.is_videots(first):  
@@ -567,30 +559,32 @@ class FFmpegGUI(Gtk.Window):
         info = self.probe_stream(probe_target)  
         rec = self.choose_super_settings(info)  
   
-        # Select libx265  
+        # Apply chosen codec  
         it = self.store_codec.get_iter_first()  
         while it:  
             if self.store_codec[it][1] == rec["codec"]:  
                 self.combo_codec.set_active_iter(it); break  
             it = self.store_codec.iter_next(it)  
   
-        # Preset and CRF  
+        # Apply preset  
         it = self.store_preset.get_iter_first()  
         while it:  
             if self.store_preset[it][0] == rec["preset"]:  
                 self.combo_preset.set_active_iter(it); break  
             it = self.store_preset.iter_next(it)  
-        self.scale_cq.set_value(rec["crf"])  
-        self.entry_bitrate.set_text("0")  
+  
+        # Quality knob and bitrate handling  
+        self.scale_cq.set_value(rec["crf_or_cq"])  
+        self.entry_bitrate.set_text("0")  # quality-based  
   
         # Save Super hints  
-        self._super_bit_depth = rec["bit_depth"]  
+        self._super_bit_depth = rec.get("bit_depth")  
         self._super_x265_params = rec.get("x265_params")  
   
-        # Launch conversion  
+        # Start conversion  
         self.on_convert(None)  
   
-    # ---------------- Convert / Build args ----------------  
+    # ----------------- Convert and building args -----------------  
   
     def on_convert(self, widget):  
         if not self.batch_files:  
@@ -603,11 +597,7 @@ class FFmpegGUI(Gtk.Window):
         self.last_speed = 1.0  
   
         self.precompute_batch_durations()  
-        if self.total_content_seconds > 0:  
-            self.label_eta.set_text("Overall ETA: calculating…")  
-        else:  
-            self.label_eta.set_text("Overall ETA: unknown")  
-  
+        self.label_eta.set_text("Overall ETA: calculating…" if self.total_content_seconds > 0 else "Overall ETA: unknown")  
         self.label_file_eta.set_text("File ETA: calculating…")  
         self.label_batch_status.set_text(f"Preparing… (0 of {self.total_items})")  
         self.btn_convert.set_sensitive(False)  
@@ -641,8 +631,9 @@ class FFmpegGUI(Gtk.Window):
         self._terminate_current_ffmpeg()  
   
     def on_donate_clicked(self, widget):  
-        url = "https://www.paypal.com/donate?business=rompstar@gmail.com&amount=5.00"  
-        webbrowser.open(url)  
+        webbrowser.open("https://www.paypal.com/donate?business=rompstar@gmail.com&amount=5.00")  
+  
+    # ----------------- Media helpers -----------------  
   
     def is_videots(self, path):  
         if os.path.isdir(path):  
@@ -689,36 +680,33 @@ class FFmpegGUI(Gtk.Window):
                 "veryslow": "p7", "placebo": "p7",  
             }  
             args += ["-preset", nvenc_preset_map.get(preset, "p5")]  
-            if use_spatial_aq:  
-                args += ["-spatial-aq", "1"]  
-            args += ["-rc:v", rc_mode]  
+  
+            # Quality-based VBR with CQ; fall back to CBR if requested  
             if rc_mode == "cbr":  
-                br = bitrate_kbps if bitrate_kbps and bitrate_kbps > 0 else 4000  
-                args += ["-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{br*2}k"]  
+                br = bitrate_kbps if bitrate_kbps and bitrate_kbps > 0 else 6000  
+                args += ["-rc:v", "cbr", "-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{br*2}k"]  
             else:  
-                args += ["-cq:v", str(int(cq))]  
-                if bitrate_kbps and bitrate_kbps > 0:  
-                    args += ["-b:v", f"{bitrate_kbps}k",  
-                             "-maxrate", f"{bitrate_kbps*2}k",  
-                             "-bufsize", f"{bitrate_kbps*4}k"]  
-                else:  
-                    args += ["-b:v", "0"]  
+                args += ["-rc:v", "vbr", "-cq:v", str(int(cq)), "-b:v", "0"]  
+  
+            # Adaptive quantization and lookahead for better quality at same size  
+            if use_spatial_aq:  
+                args += ["-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "8", "-rc-lookahead", "20"]  
+  
             if codec == "h264_nvenc":  
                 args += ["-pix_fmt", "yuv420p"]  
-            else:  # hevc_nvenc  
+            else:  
                 if desired_bit_depth >= 10:  
                     args += ["-pix_fmt", "p010le", "-profile:v", "main10"]  
                 else:  
                     args += ["-pix_fmt", "yuv420p"]  
-            # Tagging will be added in outer command for MP4/MOV  
+            # Tag for Apple players is added outside based on container  
   
         else:  
+            # CPU encoders  
             if codec in ("libx264", "libx265"):  
                 args += ["-preset", preset]  
             if bitrate_kbps and bitrate_kbps > 0:  
-                args += ["-b:v", f"{bitrate_kbps}k",  
-                         "-maxrate", f"{bitrate_kbps*2}k",  
-                         "-bufsize", f"{bitrate_kbps*4}k"]  
+                args += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps*2}k", "-bufsize", f"{bitrate_kbps*4}k"]  
             else:  
                 if codec in ("libx264", "libx265"):  
                     args += ["-crf", str(int(cq))]  
@@ -739,7 +727,7 @@ class FFmpegGUI(Gtk.Window):
   
         return args  
   
-    # ---------------- ETA helpers ----------------  
+    # ----------------- ETA helpers -----------------  
   
     def format_seconds(self, secs):  
         secs = max(0, int(round(secs)))  
@@ -793,7 +781,7 @@ class FFmpegGUI(Gtk.Window):
             text = "File ETA: unknown"  
         GLib.idle_add(self.label_file_eta.set_text, text)  
   
-    # ---------------- Core processing ----------------  
+    # ----------------- Core processing -----------------  
   
     def process_batch(self):  
         self.append_log(f"Starting batch of {len(self.batch_files)} items\n")  
@@ -810,7 +798,6 @@ class FFmpegGUI(Gtk.Window):
             base = os.path.basename(work_path)  
             ext = (self.get_combo_text(self.combo_format) or "mp4").lower()  
   
-            # duration for ETAs  
             self.current_item_duration = self.item_durations[idx] if idx < len(self.item_durations) else self.compute_item_duration(path)  
             GLib.idle_add(self.label_file_eta.set_text, "File ETA: calculating…")  
   
@@ -826,26 +813,21 @@ class FFmpegGUI(Gtk.Window):
             audio_codec = self.get_combo_value(self.combo_audio_codec, 1) or "aac"  
             rc_mode = self.get_combo_text(self.combo_rc) or "vbr"  
   
-            # Build optional video filter chain (skip scale=iw:ih no-op)  
-            vf = None  
-            if self.chk_bw.get_active():  
-                vf = "hue=s=0"  
+            # Only add filter when needed (B&W). Avoids breaking GPU zero-copy decode.  
+            vf = "hue=s=0" if self.chk_bw.get_active() else None  
   
             if len(self.batch_files) > 1:  
                 out_file_name = f"{base}_converted_{idx + 1}.{ext}"  
             else:  
                 out_file_name = self.entry_output.get_text() or f"{base}_converted.{ext}"  
   
-            if self.is_videots(work_path):  
-                parent_dir = os.path.dirname(work_path)  
-                out_file = os.path.join(parent_dir, out_file_name)  
-            else:  
-                out_file = out_file_name  
+            out_file = os.path.join(os.path.dirname(work_path), out_file_name) if self.is_videots(work_path) else out_file_name  
   
             movflags_args = ["-movflags", "+faststart"] if ext in ("mp4", "mov", "m4a", "3gp", "3g2", "mj2", "m4v") else []  
             tag_args = ["-tag:v", "hvc1"] if (ext in ("mp4","mov","m4v") and codec in ("libx265","hevc_nvenc")) else []  
   
             if self.is_videots(work_path):  
+                # For concatenated VOBs we keep CPU decode (hwaccel complicates multi-input).  
                 ts_path = os.path.join(work_path, "VIDEO_TS")  
                 if not os.path.isdir(ts_path):  
                     ts_path = work_path  
@@ -881,43 +863,31 @@ class FFmpegGUI(Gtk.Window):
                     "-map", "[a]",  
                     *video_args,  
                     *tag_args,  
-                    "-c:a", audio_codec,  
-                    "-b:a", "192k",  
+                    "-c:a", audio_codec, "-b:a", "192k",  
                     *movflags_args,  
-                    "-f", ext,  
-                    out_file,  
+                    "-f", ext, out_file,  
                 ]  
                 input_for_duration = vobs[0]  
-            else:  
-                self.append_log(f"Processing single file: {original_path}\n")  
   
+            else:  
+                # Single file; use CUDA hwaccel only when encoding with NVENC and no CPU-only filters  
+                use_cuda_decode = (codec in ("h264_nvenc","hevc_nvenc")) and self._have_cuda_hwaccel and (vf is None)  
                 bit_depth = self.get_input_bit_depth(original_path)  
                 if self._super_bit_depth is not None and codec in ("libx265","hevc_nvenc"):  
                     bit_depth = max(bit_depth, int(self._super_bit_depth))  
                 video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext)  
   
-                cmd = [  
-                    "ffmpeg", "-y",  
-                    "-i", original_path,  
-                    *video_args,  
-                    *tag_args,  
-                ]  
+                input_prefix = ["-hwaccel","cuda","-hwaccel_output_format","cuda"] if use_cuda_decode else []  
+                cmd = ["ffmpeg", "-y", *input_prefix, "-i", original_path, *video_args, *tag_args]  
                 if vf:  
                     cmd += ["-vf", vf]  
-                cmd += [  
-                    "-c:a", audio_codec,  
-                    "-b:a", "192k",  
-                    *movflags_args,  
-                    "-f", ext,  
-                    out_file,  
-                ]  
+                cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
                 input_for_duration = original_path  
   
             self.run_ffmpeg_sync(cmd, input_for_duration, duration_override=self.current_item_duration)  
   
             if self.cancel_requested:  
                 break  
-  
             self.completed_content_seconds += max(self.current_item_duration, 0.0)  
   
         self.batch_files.clear()  
@@ -944,15 +914,10 @@ class FFmpegGUI(Gtk.Window):
   
         try:  
             process = subprocess.Popen(  
-                cmd,  
-                stdout=subprocess.PIPE,  
-                stderr=subprocess.PIPE,  
-                universal_newlines=True,  
-                bufsize=1,  
-                **self._spawn_kwargs()  
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,  
+                universal_newlines=True, bufsize=1, **self._spawn_kwargs()  
             )  
             self.process = process  
-  
             re_time = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")  
             re_speed = re.compile(r"speed=\s*([\d\.]+)x")  
   
@@ -975,11 +940,9 @@ class FFmpegGUI(Gtk.Window):
                 mt = re_time.search(line)  
                 if mt:  
                     try:  
-                        h = int(mt.group(1))  
-                        m_ = int(mt.group(2))  
-                        s = int(mt.group(3))  
+                        h = int(mt.group(1)); m_ = int(mt.group(2)); s = int(mt.group(3))  
                         frac = float("0." + mt.group(4))  
-                        elapsed = h * 3600 + m_ * 60 + s + frac  
+                        elapsed = h*3600 + m_*60 + s + frac  
                     except Exception:  
                         elapsed = 0.0  
   
@@ -1026,16 +989,15 @@ class FFmpegGUI(Gtk.Window):
   
     def show_dialog(self, filename=""):  
         dlg = Gtk.MessageDialog(  
-            transient_for=self,  
-            modal=True,  
-            destroy_with_parent=True,  
-            message_type=Gtk.MessageType.INFO,  
-            buttons=Gtk.ButtonsType.OK,  
+            transient_for=self, modal=True, destroy_with_parent=True,  
+            message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,  
             text=f"Conversion Completed"  
         )  
         dlg.format_secondary_text("The video file was processed successfully.")  
         dlg.run()  
         dlg.destroy()  
+  
+    # ----------------- Hardware detection -----------------  
   
     def update_gpu_info(self):  
         self.gpu_label.set_text("Detecting hardware...")  
@@ -1049,6 +1011,7 @@ class FFmpegGUI(Gtk.Window):
             gpus = output.strip().splitlines()  
         except Exception:  
             gpus = ["Nvidia not found"]  
+        # NVENC encoders  
         try:  
             output = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True)  
             nvenc = []  
@@ -1061,8 +1024,14 @@ class FFmpegGUI(Gtk.Window):
         except Exception:  
             self._nvenc_available = set()  
             nvenc_label = "not detected"  
+        # HWACCEL (CUDA) for decode  
+        try:  
+            output = subprocess.check_output(["ffmpeg", "-hide_banner", "-hwaccels"], text=True)  
+            self._have_cuda_hwaccel = any(line.strip().lower() == "cuda" for line in output.splitlines())  
+        except Exception:  
+            self._have_cuda_hwaccel = False  
   
-        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " + nvenc_label)  
+        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " + nvenc_label + (", CUDA hwaccel" if self._have_cuda_hwaccel else ""))  
         self._prune_nvenc_from_codec_combo()  
   
     def _prune_nvenc_from_codec_combo(self):  
@@ -1081,6 +1050,8 @@ class FFmpegGUI(Gtk.Window):
             self.combo_codec.set_active(0)  
         return False  
   
+    # ----------------- Reset / misc -----------------  
+  
     def reset_ui(self):  
         self.process = None  
         self.btn_convert.set_sensitive(True)  
@@ -1089,7 +1060,6 @@ class FFmpegGUI(Gtk.Window):
         self.btn_convert.set_label("Convert")  
         self.label_selected.set_text("No files or folders selected")  
         self.label_batch_status.set_text("")  
-        # Reset ETA tracking  
         self.total_items = 0  
         self.current_index = 0  
         self.item_durations = []  
@@ -1099,7 +1069,6 @@ class FFmpegGUI(Gtk.Window):
         self.last_speed = 1.0  
         self.label_eta.set_text("Overall ETA: —")  
         self.label_file_eta.set_text("File ETA: —")  
-        # Clear Super hints for next run  
         self._super_bit_depth = None  
         self._super_x265_params = None  
         while Gtk.events_pending():  
