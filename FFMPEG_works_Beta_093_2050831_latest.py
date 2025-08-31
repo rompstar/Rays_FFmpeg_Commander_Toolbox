@@ -1,4 +1,4 @@
-# ffmpeg_commander.py — v0.9.6  
+# ffmpeg_commander.py — v0.9.3
 # Robust NVENC path: safe defaults, capability detection, and automatic fallbacks.  
 # Keeps the retro UI. Super Convert targets ≥25 fps using GPU first, then fast CPU.  
   
