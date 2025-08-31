@@ -3,6 +3,8 @@ GUI front-end for the FFMpeg tool / tested on Ubuntu Linux 25.04
 
 note: always read the CHANGELOG.md for latest revision info and Download the latest software version...
 
+I wanted it to have that classic Solaris 8 inspired look, so that's why it looks like that.
+
 ![Screenshot description](<Screenshot From 2025-08-31 13-20-09.png>)
 
 ## Demo Video
