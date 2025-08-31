@@ -18,7 +18,7 @@ The tool provides an intuitive GUI front-end to leverage FFmpeg’s powerful com
 
 ## Testing Notes
 
-I have only tested this on Ubuntu Linux 25.04 x86 and Mac M1 and M3 PowerBook / it does probably work on Windows but you have to install all the dependecies, specifically FFmpeg, Gtk3 and GI, after doing that, it should work without changing any code, but have no clue on Windows.
+I have only tested this on Ubuntu Linux 25.04 x86 and Mac M1 and M3 PowerBook / it does probably work on Windows but you have to install all the dependecies, specifically FFmpeg, Gtk3 and GI, after doing that, it "should" work without changing any code, but not tested.
 
 ## Features
 
