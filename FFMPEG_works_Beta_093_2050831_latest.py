@@ -17,7 +17,7 @@ import json
 from pathlib import Path  
   
 def load_style():  
-    # Solaris 8 like GUI feel / CDE-inspired palette  
+    # Solaris 8 / CDE-inspired palette  
     css = """  
     @define-color sol8_bg        #BFC7D5;  
     @define-color sol8_panel     #C9D3E1;  
