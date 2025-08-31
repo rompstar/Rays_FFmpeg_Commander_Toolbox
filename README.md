@@ -3,7 +3,7 @@ GUI front-end for the FFMpeg tool / tested on Ubuntu Linux 25.04
 
 note: always read the CHANGELOG.md for latest revision info and Download the latest software version...
 
-![Screenshot description](<Screenshot From 2025-08-28 21-22-14.png>)
+![Screenshot description](<Screenshot From 2025-08-31 13-20-09.png>)
 
 ## Demo Video
 
