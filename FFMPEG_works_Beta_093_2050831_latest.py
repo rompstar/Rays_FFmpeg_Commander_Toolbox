@@ -1,6 +1,8 @@
-# ffmpeg_commander.py — v0.9.4  
+# ffmpeg_commander.py — v0.9.5  
 # Full program in one block. Original retro/light window style is preserved.  
-# Super Convert now prefers GPU (NVENC) automatically for ≥25 fps, with CPU fallback.  
+# Fix: CUDA/NVENC zero‑copy path no longer forces -pix_fmt (prevents filter mismatch error).  
+# Fix: Accurate bit‑depth detection (no more “420” misread).  
+# Super Convert prefers GPU (NVENC) for ≥25 fps, with CPU fallback.  
   
 import gi  
 gi.require_version('Gtk', '3.0')  
@@ -15,7 +17,6 @@ import signal
 import json  
   
 def load_style():  
-    # Keep original style (do not change app appearance)  
     css = b"""  
     window, GtkWindow {  
         background-color: #C0C0C0;  
@@ -102,7 +103,7 @@ def load_style():
     )  
   
 class FFmpegGUI(Gtk.Window):  
-    VERSION = "0.9.4"  
+    VERSION = "0.9.5"  
   
     def __init__(self):  
         super().__init__(title=f"Ray’s FFmpeg Commander Toolbox - v{self.VERSION} Beta")  
@@ -116,7 +117,7 @@ class FFmpegGUI(Gtk.Window):
         self.duration_seconds = 0  
         self.cancel_requested = False  
   
-        # Batch/ETA tracking  
+        # Batch/ETA  
         self.total_items = 0  
         self.current_index = 0  
         self.item_durations = []  
@@ -126,10 +127,10 @@ class FFmpegGUI(Gtk.Window):
         self.last_speed = 1.0  
   
         # Hardware availability  
-        self._nvenc_available = set()  # {'h264_nvenc','hevc_nvenc'}  
+        self._nvenc_available = set()  
         self._have_cuda_hwaccel = False  
   
-        # Super Convert helpers  
+        # Super Convert hints  
         self._super_bit_depth = None  
         self._super_x265_params = None  
   
@@ -230,7 +231,7 @@ class FFmpegGUI(Gtk.Window):
         vbox.pack_start(rc_box, False, False, 0)  
         rc_box.pack_start(Gtk.Label(label="Rate control (NVENC only here): VBR or CBR.", xalign=0), False, False, 0)  
         self.store_rc = Gtk.ListStore(str)  
-        for rc in ['vbr', 'cbr']:  
+        for rc in ['vbr','cbr']:  
             self.store_rc.append([rc])  
         self.combo_rc = Gtk.ComboBox.new_with_model(self.store_rc)  
         renderer4 = Gtk.CellRendererText()  
@@ -275,7 +276,8 @@ class FFmpegGUI(Gtk.Window):
         vbox.pack_start(audio_codec_box, False, False, 0)  
         audio_codec_box.pack_start(Gtk.Label(label="Audio encoder", xalign=0), False, False, 0)  
         self.store_audio_codec = Gtk.ListStore(str, str)  
-        for disp, enc in [("AAC (aac)", "aac"), ("MP3 (libmp3lame)", "libmp3lame"), ("Opus (libopus)", "libopus"), ("AC-3 (ac3)", "ac3")]:  
+        for disp, enc in [("AAC (aac)", "aac"), ("MP3 (libmp3lame)", "libmp3lame"),  
+                          ("Opus (libopus)", "libopus"), ("AC-3 (ac3)", "ac3")]:  
             self.store_audio_codec.append([disp, enc])  
         self.combo_audio_codec = Gtk.ComboBox.new_with_model(self.store_audio_codec)  
         renderer_audio = Gtk.CellRendererText()  
@@ -307,15 +309,15 @@ class FFmpegGUI(Gtk.Window):
         self.btn_donate.connect("clicked", self.on_donate_clicked)  
         btn_box.pack_start(self.btn_donate, False, False, 0)  
   
-        # Info label explaining modes  
+        # Info label  
         info = ("Convert = use the settings above.  "  
-                "Super Convert = auto‑optimized for ≥25 fps using GPU (NVENC) if available, "  
-                "with quality‑based VBR; falls back to fast x265 on CPU.")  
+                "Super Convert = auto‑optimized for ≥25 fps using GPU (NVENC) if available; "  
+                "falls back to fast x265 on CPU.")  
         self.label_modes = Gtk.Label(label=info, xalign=0)  
         self.label_modes.set_line_wrap(True)  
         vbox.pack_start(self.label_modes, False, False, 0)  
   
-        # Log/Output  
+        # Log / Output  
         self.textbuffer = Gtk.TextBuffer()  
         self.textview = Gtk.TextView(buffer=self.textbuffer)  
         self.textview.set_editable(False)  
@@ -452,13 +454,7 @@ class FFmpegGUI(Gtk.Window):
         ncpu = os.cpu_count() or 8  
         frame_threads = 4 if ncpu >= 16 else 3  
         lookahead = 12 if ultra else 15  
-        parts = [  
-            "pmode=1",  
-            "pme=1",  
-            f"frame-threads={frame_threads}",  
-            "pools=full",  
-            f"rc-lookahead={lookahead}",  
-        ]  
+        parts = ["pmode=1", "pme=1", f"frame-threads={frame_threads}", "pools=full", f"rc-lookahead={lookahead}"]  
         if add_no_sao:  
             parts.append("no-sao=1")  
         return ":".join(parts)  
@@ -482,44 +478,26 @@ class FFmpegGUI(Gtk.Window):
             return {"codec": None, "bit_rate": 0, "w": 0, "h": 0, "pix_fmt": ""}  
   
     def choose_super_settings(self, info):  
-        # Prefer GPU first for speed ≥25 fps  
         use_hevc_nvenc = "hevc_nvenc" in self._nvenc_available  
         use_h264_nvenc = "h264_nvenc" in self._nvenc_available  
-  
         h = int(info.get("h") or 0)  
   
         if use_hevc_nvenc or use_h264_nvenc:  
             codec = "hevc_nvenc" if use_hevc_nvenc else "h264_nvenc"  
-  
-            # CQ tuned by resolution (lower = higher quality)  
             if h >= 2160:  
-                cq = 20 if codec == "hevc_nvenc" else 18  
-                preset = "slow"   # maps to p6  
+                cq = 20 if codec == "hevc_nvenc" else 18; preset = "slow"  
             elif h >= 1440:  
-                cq = 21 if codec == "hevc_nvenc" else 19  
-                preset = "slow"  
+                cq = 21 if codec == "hevc_nvenc" else 19; preset = "slow"  
             elif h >= 1080:  
-                cq = 22 if codec == "hevc_nvenc" else 20  
-                preset = "slow"  
+                cq = 22 if codec == "hevc_nvenc" else 20; preset = "slow"  
             elif h >= 720:  
-                cq = 24 if codec == "hevc_nvenc" else 22  
-                preset = "medium" # maps to p5  
+                cq = 24 if codec == "hevc_nvenc" else 22; preset = "medium"  
             else:  
-                cq = 26 if codec == "hevc_nvenc" else 24  
-                preset = "medium"  
+                cq = 26 if codec == "hevc_nvenc" else 24; preset = "medium"  
+            bit_depth = 10 if (codec == "hevc_nvenc" and re.search(r"(p010|p10|10le|10be|12|14|16)", info.get("pix_fmt",""))) else 8  
+            return {"codec": codec, "preset": preset, "crf_or_cq": cq, "bit_depth": bit_depth, "rc_mode": "vbr", "use_gpu": True}  
   
-            # HEVC 10‑bit when source is 10/12‑bit; otherwise 8‑bit  
-            bit_depth = 10 if (codec == "hevc_nvenc" and re.search(r"10|12", info.get("pix_fmt",""))) else 8  
-            return {  
-                "codec": codec,  
-                "preset": preset,  
-                "crf_or_cq": cq,  
-                "bit_depth": bit_depth,  
-                "rc_mode": "vbr",  
-                "use_gpu": True  
-            }  
-  
-        # CPU fallback (x265 fast/medium with parallel params)  
+        # CPU fallback  
         if h >= 2000:  
             preset = "fast"; crf = 24; ultra = True  
         elif h >= 1000:  
@@ -529,26 +507,18 @@ class FFmpegGUI(Gtk.Window):
         else:  
             preset = "fast"; crf = 29; ultra = False  
   
-        bit_depth = 10 if re.search(r"10|12", info.get("pix_fmt","")) else 8  
-        return {  
-            "codec": "libx265",  
-            "preset": preset,  
-            "crf_or_cq": crf,  
-            "bit_depth": bit_depth,  
-            "x265_params": self._x265_speed_params(ultra=ultra, add_no_sao=True),  
-            "rc_mode": "crf",  
-            "use_gpu": False  
-        }  
+        bit_depth = 10 if re.search(r"(p010|p10|10le|10be|12|14|16)", info.get("pix_fmt","")) else 8  
+        return {"codec":"libx265","preset":preset,"crf_or_cq":crf,"bit_depth":bit_depth,  
+                "x265_params": self._x265_speed_params(ultra=ultra, add_no_sao=True),  
+                "rc_mode":"crf","use_gpu":False}  
   
     def on_super_convert(self, _):  
         if not self.batch_files:  
             self.label_selected.set_text("No files or folders selected.")  
             return  
+        # MP4 default  
+        self.combo_format.set_active(0)  
   
-        # Force MP4 for compatibility  
-        self.combo_format.set_active(0)  # mp4  
-  
-        # Probe first file (or first VOB)  
         first = self.batch_files[0]  
         probe_target = first  
         if self.is_videots(first):  
@@ -559,32 +529,27 @@ class FFmpegGUI(Gtk.Window):
         info = self.probe_stream(probe_target)  
         rec = self.choose_super_settings(info)  
   
-        # Apply chosen codec  
+        # Set codec  
         it = self.store_codec.get_iter_first()  
         while it:  
             if self.store_codec[it][1] == rec["codec"]:  
                 self.combo_codec.set_active_iter(it); break  
             it = self.store_codec.iter_next(it)  
-  
-        # Apply preset  
+        # Set preset  
         it = self.store_preset.get_iter_first()  
         while it:  
             if self.store_preset[it][0] == rec["preset"]:  
                 self.combo_preset.set_active_iter(it); break  
             it = self.store_preset.iter_next(it)  
   
-        # Quality knob and bitrate handling  
         self.scale_cq.set_value(rec["crf_or_cq"])  
-        self.entry_bitrate.set_text("0")  # quality-based  
-  
-        # Save Super hints  
+        self.entry_bitrate.set_text("0")  
         self._super_bit_depth = rec.get("bit_depth")  
         self._super_x265_params = rec.get("x265_params")  
   
-        # Start conversion  
         self.on_convert(None)  
   
-    # ----------------- Convert and building args -----------------  
+    # ----------------- Convert / build args -----------------  
   
     def on_convert(self, widget):  
         if not self.batch_files:  
@@ -646,6 +611,28 @@ class FFmpegGUI(Gtk.Window):
     def get_videos(self, ts_path):  
         return sorted([os.path.join(ts_path, f) for f in os.listdir(ts_path) if f.upper().endswith(".VOB")])  
   
+    def _bit_depth_from_pix_fmt(self, fmt):  
+        fmt = (fmt or "").lower()  
+        if any(x in fmt for x in ["p16","16le","16be"]): return 16  
+        if any(x in fmt for x in ["p14","14le","14be"]): return 14  
+        if any(x in fmt for x in ["p12","12le","12be"]): return 12  
+        if any(x in fmt for x in ["p010","p10","10le","10be"]): return 10  
+        return 8  
+  
+    def get_input_bit_depth(self, path):  
+        try:  
+            j = subprocess.check_output([  
+                "ffprobe","-v","error","-select_streams","v:0",  
+                "-show_entries","stream=bits_per_raw_sample,pix_fmt","-of","json", path  
+            ], text=True)  
+            s = json.loads(j)["streams"][0]  
+            b = s.get("bits_per_raw_sample")  
+            if b and str(b).isdigit():  
+                return int(b)  
+            return self._bit_depth_from_pix_fmt(s.get("pix_fmt",""))  
+        except Exception:  
+            return 8  
+  
     def get_duration(self, filepath):  
         if not filepath or not os.path.exists(filepath):  
             return 0  
@@ -658,72 +645,61 @@ class FFmpegGUI(Gtk.Window):
         except (ValueError, TypeError):  
             return 0  
   
-    def get_input_bit_depth(self, path):  
-        try:  
-            out = subprocess.check_output(  
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",  
-                 "-show_entries", "stream=pix_fmt",  
-                 "-of", "default=nw=1:nk=1", path],  
-                text=True).strip()  
-            m = re.search(r"(\d+)", out)  
-            return int(m.group(1)) if m else 8  
-        except Exception:  
-            return 8  
-  
-    def build_video_args(self, codec, preset, rc_mode, cq, bitrate_kbps, desired_bit_depth, use_spatial_aq, container_ext):  
+    def build_video_args(self, codec, preset, rc_mode, cq, bitrate_kbps, desired_bit_depth, use_spatial_aq, container_ext, using_cuda_frames=False):  
         args = ["-c:v", codec]  
   
         if codec in ("h264_nvenc", "hevc_nvenc"):  
             nvenc_preset_map = {  
-                "ultrafast": "p1", "superfast": "p1", "veryfast": "p2", "faster": "p3",  
-                "fast": "p4", "medium": "p5", "slow": "p6", "slower": "p6",  
-                "veryslow": "p7", "placebo": "p7",  
+                "ultrafast":"p1","superfast":"p1","veryfast":"p2","faster":"p3",  
+                "fast":"p4","medium":"p5","slow":"p6","slower":"p6","veryslow":"p7","placebo":"p7",  
             }  
             args += ["-preset", nvenc_preset_map.get(preset, "p5")]  
   
-            # Quality-based VBR with CQ; fall back to CBR if requested  
             if rc_mode == "cbr":  
                 br = bitrate_kbps if bitrate_kbps and bitrate_kbps > 0 else 6000  
-                args += ["-rc:v", "cbr", "-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{br*2}k"]  
+                args += ["-rc:v","cbr","-b:v",f"{br}k","-maxrate",f"{br}k","-bufsize",f"{br*2}k"]  
             else:  
-                args += ["-rc:v", "vbr", "-cq:v", str(int(cq)), "-b:v", "0"]  
+                args += ["-rc:v","vbr","-cq:v",str(int(cq)),"-b:v","0"]  
   
-            # Adaptive quantization and lookahead for better quality at same size  
             if use_spatial_aq:  
-                args += ["-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "8", "-rc-lookahead", "20"]  
+                args += ["-spatial-aq","1","-temporal-aq","1","-aq-strength","8","-rc-lookahead","20"]  
   
-            if codec == "h264_nvenc":  
-                args += ["-pix_fmt", "yuv420p"]  
+            # IMPORTANT: if using CUDA hw frames, DO NOT force -pix_fmt.  
+            if using_cuda_frames:  
+                if codec == "hevc_nvenc" and desired_bit_depth >= 10:  
+                    args += ["-profile:v","main10"]  
             else:  
-                if desired_bit_depth >= 10:  
-                    args += ["-pix_fmt", "p010le", "-profile:v", "main10"]  
+                if codec == "h264_nvenc":  
+                    args += ["-pix_fmt","yuv420p"]  
                 else:  
-                    args += ["-pix_fmt", "yuv420p"]  
-            # Tag for Apple players is added outside based on container  
+                    if desired_bit_depth >= 10:  
+                        args += ["-pix_fmt","p010le","-profile:v","main10"]  
+                    else:  
+                        args += ["-pix_fmt","yuv420p"]  
   
         else:  
             # CPU encoders  
-            if codec in ("libx264", "libx265"):  
+            if codec in ("libx264","libx265"):  
                 args += ["-preset", preset]  
             if bitrate_kbps and bitrate_kbps > 0:  
-                args += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps*2}k", "-bufsize", f"{bitrate_kbps*4}k"]  
+                args += ["-b:v",f"{bitrate_kbps}k","-maxrate",f"{bitrate_kbps*2}k","-bufsize",f"{bitrate_kbps*4}k"]  
             else:  
-                if codec in ("libx264", "libx265"):  
+                if codec in ("libx264","libx265"):  
                     args += ["-crf", str(int(cq))]  
   
             if codec == "libx265":  
                 params = []  
                 if desired_bit_depth >= 10:  
-                    args += ["-pix_fmt", "yuv420p10le"]  
+                    args += ["-pix_fmt","yuv420p10le"]  
                     params.append("profile=main10")  
                 else:  
-                    args += ["-pix_fmt", "yuv420p"]  
+                    args += ["-pix_fmt","yuv420p"]  
                 if self._super_x265_params:  
                     params.append(self._super_x265_params)  
                 if params:  
                     args += ["-x265-params", ":".join(params)]  
             elif codec == "libx264":  
-                args += ["-pix_fmt", "yuv420p"]  
+                args += ["-pix_fmt","yuv420p"]  
   
         return args  
   
@@ -813,7 +789,6 @@ class FFmpegGUI(Gtk.Window):
             audio_codec = self.get_combo_value(self.combo_audio_codec, 1) or "aac"  
             rc_mode = self.get_combo_text(self.combo_rc) or "vbr"  
   
-            # Only add filter when needed (B&W). Avoids breaking GPU zero-copy decode.  
             vf = "hue=s=0" if self.chk_bw.get_active() else None  
   
             if len(self.batch_files) > 1:  
@@ -823,11 +798,10 @@ class FFmpegGUI(Gtk.Window):
   
             out_file = os.path.join(os.path.dirname(work_path), out_file_name) if self.is_videots(work_path) else out_file_name  
   
-            movflags_args = ["-movflags", "+faststart"] if ext in ("mp4", "mov", "m4a", "3gp", "3g2", "mj2", "m4v") else []  
+            movflags_args = ["-movflags", "+faststart"] if ext in ("mp4","mov","m4a","3gp","3g2","mj2","m4v") else []  
             tag_args = ["-tag:v", "hvc1"] if (ext in ("mp4","mov","m4v") and codec in ("libx265","hevc_nvenc")) else []  
   
             if self.is_videots(work_path):  
-                # For concatenated VOBs we keep CPU decode (hwaccel complicates multi-input).  
                 ts_path = os.path.join(work_path, "VIDEO_TS")  
                 if not os.path.isdir(ts_path):  
                     ts_path = work_path  
@@ -853,32 +827,29 @@ class FFmpegGUI(Gtk.Window):
                 bit_depth = 8  
                 if self._super_bit_depth is not None and codec in ("libx265","hevc_nvenc"):  
                     bit_depth = max(bit_depth, int(self._super_bit_depth))  
-                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext)  
+                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext, using_cuda_frames=False)  
   
                 cmd = [  
-                    "ffmpeg", "-y",  
+                    "ffmpeg","-y",  
                     *input_args,  
                     "-filter_complex", filter_complex,  
-                    "-map", vmap,  
-                    "-map", "[a]",  
-                    *video_args,  
-                    *tag_args,  
+                    "-map", vmap, "-map", "[a]",  
+                    *video_args, *tag_args,  
                     "-c:a", audio_codec, "-b:a", "192k",  
-                    *movflags_args,  
-                    "-f", ext, out_file,  
+                    *movflags_args, "-f", ext, out_file  
                 ]  
                 input_for_duration = vobs[0]  
   
             else:  
-                # Single file; use CUDA hwaccel only when encoding with NVENC and no CPU-only filters  
+                # Single file: use CUDA hw frames for NVENC when no CPU-only filters are needed  
                 use_cuda_decode = (codec in ("h264_nvenc","hevc_nvenc")) and self._have_cuda_hwaccel and (vf is None)  
                 bit_depth = self.get_input_bit_depth(original_path)  
                 if self._super_bit_depth is not None and codec in ("libx265","hevc_nvenc"):  
                     bit_depth = max(bit_depth, int(self._super_bit_depth))  
-                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext)  
+                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext, using_cuda_frames=use_cuda_decode)  
   
                 input_prefix = ["-hwaccel","cuda","-hwaccel_output_format","cuda"] if use_cuda_decode else []  
-                cmd = ["ffmpeg", "-y", *input_prefix, "-i", original_path, *video_args, *tag_args]  
+                cmd = ["ffmpeg","-y", *input_prefix, "-i", original_path, *video_args, *tag_args]  
                 if vf:  
                     cmd += ["-vf", vf]  
                 cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
@@ -991,7 +962,7 @@ class FFmpegGUI(Gtk.Window):
         dlg = Gtk.MessageDialog(  
             transient_for=self, modal=True, destroy_with_parent=True,  
             message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,  
-            text=f"Conversion Completed"  
+            text="Conversion Completed"  
         )  
         dlg.format_secondary_text("The video file was processed successfully.")  
         dlg.run()  
@@ -1011,7 +982,6 @@ class FFmpegGUI(Gtk.Window):
             gpus = output.strip().splitlines()  
         except Exception:  
             gpus = ["Nvidia not found"]  
-        # NVENC encoders  
         try:  
             output = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True)  
             nvenc = []  
@@ -1024,7 +994,6 @@ class FFmpegGUI(Gtk.Window):
         except Exception:  
             self._nvenc_available = set()  
             nvenc_label = "not detected"  
-        # HWACCEL (CUDA) for decode  
         try:  
             output = subprocess.check_output(["ffmpeg", "-hide_banner", "-hwaccels"], text=True)  
             self._have_cuda_hwaccel = any(line.strip().lower() == "cuda" for line in output.splitlines())  
@@ -1040,7 +1009,7 @@ class FFmpegGUI(Gtk.Window):
         it = self.store_codec.get_iter_first()  
         while it:  
             enc = self.store_codec[it][1]  
-            if enc in ("h264_nvenc", "hevc_nvenc") and enc not in avail:  
+            if enc in ("h264_nvenc","hevc_nvenc") and enc not in avail:  
                 to_remove_paths.append(self.store_codec.get_path(it))  
             it = self.store_codec.iter_next(it)  
         for path in reversed(to_remove_paths):  
