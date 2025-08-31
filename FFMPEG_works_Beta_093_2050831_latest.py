@@ -1,8 +1,6 @@
-# ffmpeg_commander.py — v0.9.5  
-# Full program in one block. Original retro/light window style is preserved.  
-# Fix: CUDA/NVENC zero‑copy path no longer forces -pix_fmt (prevents filter mismatch error).  
-# Fix: Accurate bit‑depth detection (no more “420” misread).  
-# Super Convert prefers GPU (NVENC) for ≥25 fps, with CPU fallback.  
+# ffmpeg_commander.py — v0.9.6  
+# Robust NVENC path: safe defaults, capability detection, and automatic fallbacks.  
+# Keeps the retro UI. Super Convert targets ≥25 fps using GPU first, then fast CPU.  
   
 import gi  
 gi.require_version('Gtk', '3.0')  
@@ -103,7 +101,7 @@ def load_style():
     )  
   
 class FFmpegGUI(Gtk.Window):  
-    VERSION = "0.9.5"  
+    VERSION = "0.9.6"  
   
     def __init__(self):  
         super().__init__(title=f"Ray’s FFmpeg Commander Toolbox - v{self.VERSION} Beta")  
@@ -114,7 +112,7 @@ class FFmpegGUI(Gtk.Window):
         # State  
         self.batch_files = []  
         self.process = None  
-        self.duration_seconds = 0  
+        self.duration_seconds = 0.0  
         self.cancel_requested = False  
   
         # Batch/ETA  
@@ -129,6 +127,7 @@ class FFmpegGUI(Gtk.Window):
         # Hardware availability  
         self._nvenc_available = set()  
         self._have_cuda_hwaccel = False  
+        self._nvenc_caps = {}  # per codec: {'temporal_aq':bool, 'rc_lookahead':bool, 'p010':bool}  
   
         # Super Convert hints  
         self._super_bit_depth = None  
@@ -262,7 +261,7 @@ class FFmpegGUI(Gtk.Window):
         self.entry_bitrate.set_hexpand(True)  
         bitrate_box.pack_start(self.entry_bitrate, False, False, 0)  
   
-        # Checkboxes  
+        # Toggles  
         self.chk_spatial = Gtk.CheckButton(label="Enable Spatial AQ (NVENC encoders only)")  
         self.chk_spatial.set_active(True)  
         vbox.pack_start(self.chk_spatial, False, False, 0)  
@@ -309,15 +308,15 @@ class FFmpegGUI(Gtk.Window):
         self.btn_donate.connect("clicked", self.on_donate_clicked)  
         btn_box.pack_start(self.btn_donate, False, False, 0)  
   
-        # Info label  
+        # Info  
         info = ("Convert = use the settings above.  "  
                 "Super Convert = auto‑optimized for ≥25 fps using GPU (NVENC) if available; "  
-                "falls back to fast x265 on CPU.")  
+                "falls back to fast CPU if needed.")  
         self.label_modes = Gtk.Label(label=info, xalign=0)  
         self.label_modes.set_line_wrap(True)  
         vbox.pack_start(self.label_modes, False, False, 0)  
   
-        # Log / Output  
+        # Logs + progress  
         self.textbuffer = Gtk.TextBuffer()  
         self.textview = Gtk.TextView(buffer=self.textbuffer)  
         self.textview.set_editable(False)  
@@ -332,7 +331,6 @@ class FFmpegGUI(Gtk.Window):
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)  
         vbox.pack_start(scroll, True, True, 0)  
   
-        # ETA + progress  
         self.label_file_eta = Gtk.Label(label="File ETA: —", xalign=0)  
         vbox.pack_start(self.label_file_eta, False, False, 0)  
         self.label_eta = Gtk.Label(label="Overall ETA: —", xalign=0)  
@@ -346,7 +344,7 @@ class FFmpegGUI(Gtk.Window):
   
         self.show_all()  
   
-    # ----------------- UI helpers -----------------  
+    # --------------- UI helpers ---------------  
   
     def append_log(self, text: str):  
         def _append():  
@@ -406,9 +404,6 @@ class FFmpegGUI(Gtk.Window):
                     self.entry_output.set_text(f"{base}_converted.{ext}")  
             else:  
                 self.label_selected.set_text("No files selected.")  
-                self.append_log("No files selected from dialog\n")  
-        else:  
-            self.append_log("File selection cancelled\n")  
         dialog.destroy()  
   
     def on_choose_folders(self, widget):  
@@ -421,7 +416,6 @@ class FFmpegGUI(Gtk.Window):
             self.batch_files.clear()  
             self.batch_files.extend(folders)  
             self.label_selected.set_text(f"{len(self.batch_files)} folders selected")  
-            self.append_log(f"Selected folders: {folders}\n")  
             for folder in folders:  
                 if self.is_videots(folder):  
                     video_ts_path = folder if os.path.basename(folder).upper() == "VIDEO_TS" else os.path.join(folder, "VIDEO_TS")  
@@ -439,8 +433,6 @@ class FFmpegGUI(Gtk.Window):
                 base = os.path.basename(first)  
                 ext = self.get_combo_text(self.combo_format) or "mp4"  
                 self.entry_output.set_text(f"{base}_converted.{ext}")  
-        else:  
-            self.append_log("Folder selection cancelled\n")  
         dialog.destroy()  
   
     def on_clear_selection(self, widget):  
@@ -448,7 +440,7 @@ class FFmpegGUI(Gtk.Window):
         self.label_selected.set_text("No files or folders selected")  
         self.append_log("Selection cleared by user\n")  
   
-    # ----------------- Super Convert -----------------  
+    # --------------- Super Convert ---------------  
   
     def _x265_speed_params(self, ultra=False, add_no_sao=False):  
         ncpu = os.cpu_count() or 8  
@@ -494,10 +486,11 @@ class FFmpegGUI(Gtk.Window):
                 cq = 24 if codec == "hevc_nvenc" else 22; preset = "medium"  
             else:  
                 cq = 26 if codec == "hevc_nvenc" else 24; preset = "medium"  
-            bit_depth = 10 if (codec == "hevc_nvenc" and re.search(r"(p010|p10|10le|10be|12|14|16)", info.get("pix_fmt",""))) else 8  
+            # Only target 10-bit when source is ≥10-bit  
+            bit_depth = 10 if re.search(r"(p010|p10|10le|10be|12|14|16)", info.get("pix_fmt","")) and codec=="hevc_nvenc" else 8  
             return {"codec": codec, "preset": preset, "crf_or_cq": cq, "bit_depth": bit_depth, "rc_mode": "vbr", "use_gpu": True}  
   
-        # CPU fallback  
+        # CPU fallback profile  
         if h >= 2000:  
             preset = "fast"; crf = 24; ultra = True  
         elif h >= 1000:  
@@ -516,8 +509,8 @@ class FFmpegGUI(Gtk.Window):
         if not self.batch_files:  
             self.label_selected.set_text("No files or folders selected.")  
             return  
-        # MP4 default  
-        self.combo_format.set_active(0)  
+  
+        self.combo_format.set_active(0)  # MP4  
   
         first = self.batch_files[0]  
         probe_target = first  
@@ -549,7 +542,7 @@ class FFmpegGUI(Gtk.Window):
   
         self.on_convert(None)  
   
-    # ----------------- Convert / build args -----------------  
+    # --------------- Convert / args building ---------------  
   
     def on_convert(self, widget):  
         if not self.batch_files:  
@@ -598,7 +591,7 @@ class FFmpegGUI(Gtk.Window):
     def on_donate_clicked(self, widget):  
         webbrowser.open("https://www.paypal.com/donate?business=rompstar@gmail.com&amount=5.00")  
   
-    # ----------------- Media helpers -----------------  
+    # --------------- Media helpers ---------------  
   
     def is_videots(self, path):  
         if os.path.isdir(path):  
@@ -645,34 +638,64 @@ class FFmpegGUI(Gtk.Window):
         except (ValueError, TypeError):  
             return 0  
   
-    def build_video_args(self, codec, preset, rc_mode, cq, bitrate_kbps, desired_bit_depth, use_spatial_aq, container_ext, using_cuda_frames=False):  
+    def _query_nvenc_help(self, codec):  
+        caps = {'temporal_aq': False, 'rc_lookahead': False, 'p010': False, 'pix_fmts': []}  
+        try:  
+            out = subprocess.check_output(["ffmpeg","-hide_banner","-h",f"encoder={codec}"], text=True, stderr=subprocess.STDOUT)  
+            caps['temporal_aq'] = ("temporal_aq" in out)  
+            caps['rc_lookahead'] = ("rc-lookahead" in out)  
+            m = re.search(r"Supported pixel formats:\s*(.+)", out, re.IGNORECASE)  
+            if m:  
+                px = m.group(1).strip().lower()  
+                caps['pix_fmts'] = [p.strip() for p in re.split(r"[ ,]+", px)]  
+                caps['p010'] = ("p010le" in px)  
+        except Exception:  
+            pass  
+        return caps  
+  
+    def build_video_args(self, codec, preset, rc_mode, cq, bitrate_kbps, desired_bit_depth,  
+                         use_spatial_aq, container_ext, using_cuda_frames=False, nvenc_safe=False):  
         args = ["-c:v", codec]  
   
         if codec in ("h264_nvenc", "hevc_nvenc"):  
+            # Map x264/x265 presets to NVENC p1–p7  
             nvenc_preset_map = {  
                 "ultrafast":"p1","superfast":"p1","veryfast":"p2","faster":"p3",  
                 "fast":"p4","medium":"p5","slow":"p6","slower":"p6","veryslow":"p7","placebo":"p7",  
             }  
             args += ["-preset", nvenc_preset_map.get(preset, "p5")]  
   
+            # Rate control  
             if rc_mode == "cbr":  
                 br = bitrate_kbps if bitrate_kbps and bitrate_kbps > 0 else 6000  
                 args += ["-rc:v","cbr","-b:v",f"{br}k","-maxrate",f"{br}k","-bufsize",f"{br*2}k"]  
             else:  
                 args += ["-rc:v","vbr","-cq:v",str(int(cq)),"-b:v","0"]  
   
+            caps = self._nvenc_caps.get(codec, {})  
+            # Spatial AQ is generally widely supported  
             if use_spatial_aq:  
-                args += ["-spatial-aq","1","-temporal-aq","1","-aq-strength","8","-rc-lookahead","20"]  
+                args += ["-spatial-aq","1","-aq-strength","8"]  
   
-            # IMPORTANT: if using CUDA hw frames, DO NOT force -pix_fmt.  
+            # Only enable temporal AQ / lookahead when SAFE and advertised by ffmpeg build  
+            if not nvenc_safe:  
+                if caps.get('temporal_aq', False):  
+                    args += ["-temporal-aq","1"]  
+                if caps.get('rc_lookahead', False):  
+                    args += ["-rc-lookahead","20"]  
+  
+            # Pixel format handling:  
+            # - When using CUDA frames, don't force -pix_fmt (avoid GPU/CPU format mismatch).  
+            # - Otherwise, set a CPU pix_fmt.  
             if using_cuda_frames:  
                 if codec == "hevc_nvenc" and desired_bit_depth >= 10:  
+                    # Request main10 profile only; pix_fmt will be GPU frames  
                     args += ["-profile:v","main10"]  
             else:  
                 if codec == "h264_nvenc":  
                     args += ["-pix_fmt","yuv420p"]  
-                else:  
-                    if desired_bit_depth >= 10:  
+                else:  # hevc_nvenc  
+                    if desired_bit_depth >= 10 and caps.get('p010', False):  
                         args += ["-pix_fmt","p010le","-profile:v","main10"]  
                     else:  
                         args += ["-pix_fmt","yuv420p"]  
@@ -703,7 +726,7 @@ class FFmpegGUI(Gtk.Window):
   
         return args  
   
-    # ----------------- ETA helpers -----------------  
+    # --------------- ETA helpers ---------------  
   
     def format_seconds(self, secs):  
         secs = max(0, int(round(secs)))  
@@ -757,7 +780,7 @@ class FFmpegGUI(Gtk.Window):
             text = "File ETA: unknown"  
         GLib.idle_add(self.label_file_eta.set_text, text)  
   
-    # ----------------- Core processing -----------------  
+    # --------------- Core processing ---------------  
   
     def process_batch(self):  
         self.append_log(f"Starting batch of {len(self.batch_files)} items\n")  
@@ -788,7 +811,6 @@ class FFmpegGUI(Gtk.Window):
             preset = self.get_combo_text(self.combo_preset) or "medium"  
             audio_codec = self.get_combo_value(self.combo_audio_codec, 1) or "aac"  
             rc_mode = self.get_combo_text(self.combo_rc) or "vbr"  
-  
             vf = "hue=s=0" if self.chk_bw.get_active() else None  
   
             if len(self.batch_files) > 1:  
@@ -799,9 +821,15 @@ class FFmpegGUI(Gtk.Window):
             out_file = os.path.join(os.path.dirname(work_path), out_file_name) if self.is_videots(work_path) else out_file_name  
   
             movflags_args = ["-movflags", "+faststart"] if ext in ("mp4","mov","m4a","3gp","3g2","mj2","m4v") else []  
-            tag_args = ["-tag:v", "hvc1"] if (ext in ("mp4","mov","m4v") and codec in ("libx265","hevc_nvenc")) else []  
+            tag_args = []  
+            if ext in ("mp4","mov","m4v") and codec in ("libx265","hevc_nvenc"):  
+                tag_args = ["-tag:v", "hvc1"]  
+  
+            # Build + run with intelligent fallbacks  
+            success = False  
   
             if self.is_videots(work_path):  
+                # VIDEO_TS path: keep CPU decode; GPU decode complicates concat  
                 ts_path = os.path.join(work_path, "VIDEO_TS")  
                 if not os.path.isdir(ts_path):  
                     ts_path = work_path  
@@ -827,8 +855,9 @@ class FFmpegGUI(Gtk.Window):
                 bit_depth = 8  
                 if self._super_bit_depth is not None and codec in ("libx265","hevc_nvenc"):  
                     bit_depth = max(bit_depth, int(self._super_bit_depth))  
-                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext, using_cuda_frames=False)  
   
+                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth,  
+                                                   self.chk_spatial.get_active(), ext, using_cuda_frames=False, nvenc_safe=False)  
                 cmd = [  
                     "ffmpeg","-y",  
                     *input_args,  
@@ -838,28 +867,122 @@ class FFmpegGUI(Gtk.Window):
                     "-c:a", audio_codec, "-b:a", "192k",  
                     *movflags_args, "-f", ext, out_file  
                 ]  
-                input_for_duration = vobs[0]  
+                ret, stderr_text = self.run_ffmpeg_sync(cmd, vobs[0], duration_override=self.current_item_duration)  
+                success = (ret == 0)  
+  
+                if not success and codec in ("h264_nvenc","hevc_nvenc"):  
+                    # Safe retry without advanced NVENC knobs  
+                    self.append_log("Retrying NVENC in safe mode (no temporal AQ / lookahead)…\n")  
+                    video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth,  
+                                                       self.chk_spatial.get_active(), ext, using_cuda_frames=False, nvenc_safe=True)  
+                    cmd = [  
+                        "ffmpeg","-y",  
+                        *input_args,  
+                        "-filter_complex", filter_complex,  
+                        "-map", vmap, "-map", "[a]",  
+                        *video_args, *tag_args,  
+                        "-c:a", audio_codec, "-b:a", "192k",  
+                        *movflags_args, "-f", ext, out_file  
+                    ]  
+                    ret, stderr_text = self.run_ffmpeg_sync(cmd, vobs[0], duration_override=self.current_item_duration)  
+                    success = (ret == 0)  
   
             else:  
-                # Single file: use CUDA hw frames for NVENC when no CPU-only filters are needed  
+                # Single file: start with CUDA hw frames for NVENC when no CPU filters  
                 use_cuda_decode = (codec in ("h264_nvenc","hevc_nvenc")) and self._have_cuda_hwaccel and (vf is None)  
                 bit_depth = self.get_input_bit_depth(original_path)  
                 if self._super_bit_depth is not None and codec in ("libx265","hevc_nvenc"):  
                     bit_depth = max(bit_depth, int(self._super_bit_depth))  
-                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth, self.chk_spatial.get_active(), ext, using_cuda_frames=use_cuda_decode)  
   
+                # Ensure caps are known for the chosen NVENC codec  
+                if codec in ("h264_nvenc","hevc_nvenc") and codec not in self._nvenc_caps:  
+                    self._nvenc_caps[codec] = self._query_nvenc_help(codec)  
+  
+                video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth,  
+                                                   self.chk_spatial.get_active(), ext,  
+                                                   using_cuda_frames=use_cuda_decode, nvenc_safe=False)  
                 input_prefix = ["-hwaccel","cuda","-hwaccel_output_format","cuda"] if use_cuda_decode else []  
                 cmd = ["ffmpeg","-y", *input_prefix, "-i", original_path, *video_args, *tag_args]  
                 if vf:  
                     cmd += ["-vf", vf]  
                 cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
-                input_for_duration = original_path  
   
-            self.run_ffmpeg_sync(cmd, input_for_duration, duration_override=self.current_item_duration)  
+                ret, stderr_text = self.run_ffmpeg_sync(cmd, original_path, duration_override=self.current_item_duration)  
+                success = (ret == 0)  
   
+                # Fallbacks if NVENC path fails  
+                if not success and codec in ("h264_nvenc","hevc_nvenc"):  
+                    if ("Temporal AQ not supported" in stderr_text or  
+                        "rc-lookahead" in stderr_text or  
+                        "Provided device doesn't support required NVENC features" in stderr_text or  
+                        "Could not open encoder" in stderr_text):  
+                        self.append_log("Retrying NVENC in safe mode (no temporal AQ / lookahead)…\n")  
+                        video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth,  
+                                                           self.chk_spatial.get_active(), ext,  
+                                                           using_cuda_frames=use_cuda_decode, nvenc_safe=True)  
+                        cmd = ["ffmpeg","-y", *input_prefix, "-i", original_path, *video_args, *tag_args]  
+                        if vf:  
+                            cmd += ["-vf", vf]  
+                        cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
+                        ret, stderr_text = self.run_ffmpeg_sync(cmd, original_path, duration_override=self.current_item_duration)  
+                        success = (ret == 0)  
+  
+                if not success and codec in ("h264_nvenc","hevc_nvenc"):  
+                    # If format mismatch or not implemented, drop CUDA decode and try again  
+                    if ("auto_scale_0" in stderr_text or "Function not implemented" in stderr_text or  
+                        "Impossible to convert between the formats" in stderr_text):  
+                        self.append_log("Retrying NVENC without CUDA hw decode (CPU decode → NVENC)…\n")  
+                        video_args = self.build_video_args(codec, preset, rc_mode, cq, bitrate_value, bit_depth,  
+                                                           self.chk_spatial.get_active(), ext,  
+                                                           using_cuda_frames=False, nvenc_safe=True)  
+                        cmd = ["ffmpeg","-y", "-i", original_path, *video_args, *tag_args]  
+                        if vf:  
+                            cmd += ["-vf", vf]  
+                        cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
+                        ret, stderr_text = self.run_ffmpeg_sync(cmd, original_path, duration_override=self.current_item_duration)  
+                        success = (ret == 0)  
+  
+                if not success and codec == "hevc_nvenc" and "h264_nvenc" in self._nvenc_available:  
+                    self.append_log("Falling back to H.264 NVENC for compatibility…\n")  
+                    codec2 = "h264_nvenc"  
+                    # Rebuild without CUDA decode if earlier failed that way  
+                    video_args = self.build_video_args(codec2, preset, rc_mode, cq, bitrate_value, 8,  
+                                                       self.chk_spatial.get_active(), ext,  
+                                                       using_cuda_frames=False, nvenc_safe=True)  
+                    cmd = ["ffmpeg","-y", "-i", original_path, *video_args]  # no hvc1 tag for H.264  
+                    if vf:  
+                        cmd += ["-vf", vf]  
+                    cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
+                    ret, stderr_text = self.run_ffmpeg_sync(cmd, original_path, duration_override=self.current_item_duration)  
+                    success = (ret == 0)  
+  
+                if not success and codec in ("h264_nvenc","hevc_nvenc"):  
+                    self.append_log("Falling back to CPU x264 veryfast (should exceed 25 fps at 1080p)…\n")  
+                    codec3 = "libx264"  
+                    preset3 = "veryfast"  
+                    cq3 = min(cq, 22)  # keep quality decent  
+                    video_args = self.build_video_args(codec3, preset3, "crf", cq3, bitrate_value, 8,  
+                                                       False, ext, using_cuda_frames=False)  
+                    cmd = ["ffmpeg","-y", "-i", original_path, *video_args]  
+                    if vf:  
+                        cmd += ["-vf", vf]  
+                    cmd += ["-c:a", audio_codec, "-b:a", "192k", *movflags_args, "-f", ext, out_file]  
+                    ret, stderr_text = self.run_ffmpeg_sync(cmd, original_path, duration_override=self.current_item_duration)  
+                    success = (ret == 0)  
+  
+            # Wrap-up per item  
             if self.cancel_requested:  
                 break  
-            self.completed_content_seconds += max(self.current_item_duration, 0.0)  
+  
+            if success:  
+                self.append_log("\n✅ Conversion completed successfully.\n")  
+                GLib.idle_add(self.update_progress, 1.0)  
+                GLib.idle_add(self.label_file_eta.set_text, "File ETA: 0:00:00 (done)")  
+                if self.total_items <= 1:  
+                    GLib.idle_add(self.show_dialog)  
+                self.completed_content_seconds += max(self.current_item_duration, 0.0)  
+            else:  
+                self.append_log("\n❌ Conversion failed after fallbacks.\n")  
   
         self.batch_files.clear()  
         if self.cancel_requested:  
@@ -883,6 +1006,7 @@ class FFmpegGUI(Gtk.Window):
         GLib.idle_add(self.progressbar.set_fraction, 0)  
         GLib.idle_add(self.progressbar.set_show_text, True)  
   
+        stderr_lines = []  
         try:  
             process = subprocess.Popen(  
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,  
@@ -895,6 +1019,7 @@ class FFmpegGUI(Gtk.Window):
             for line in iter(process.stderr.readline, ''):  
                 if not line:  
                     break  
+                stderr_lines.append(line)  
                 self.append_log(line)  
   
                 if self.cancel_requested:  
@@ -925,22 +1050,11 @@ class FFmpegGUI(Gtk.Window):
                     self.update_overall_eta(elapsed, self.last_speed)  
   
             ret = process.wait()  
+            return ret, "".join(stderr_lines)  
   
-            if self.cancel_requested:  
-                self.append_log("\n🛑 Cancelled by user.\n")  
-                return  
-  
-            if ret == 0:  
-                GLib.idle_add(self.append_log, "\n✅ Conversion completed successfully.\n")  
-                GLib.idle_add(self.update_progress, 1.0)  
-                GLib.idle_add(self.label_file_eta.set_text, "File ETA: 0:00:00 (done)")  
-                if self.total_items <= 1:  
-                    GLib.idle_add(self.show_dialog)  
-            else:  
-                GLib.idle_add(self.append_log, f"\n❌ Conversion failed (code {ret}).\n")  
-                GLib.idle_add(self.update_progress, 0.0)  
         except Exception as e:  
-            GLib.idle_add(self.append_log, f"\nError: {str(e)}\n")  
+            self.append_log(f"\nError: {str(e)}\n")  
+            return 1, f"Exception: {e}"  
         finally:  
             self.process = None  
   
@@ -968,7 +1082,7 @@ class FFmpegGUI(Gtk.Window):
         dlg.run()  
         dlg.destroy()  
   
-    # ----------------- Hardware detection -----------------  
+    # --------------- Hardware detection ---------------  
   
     def update_gpu_info(self):  
         self.gpu_label.set_text("Detecting hardware...")  
@@ -990,6 +1104,9 @@ class FFmpegGUI(Gtk.Window):
             if "hevc_nvenc" in output:  
                 nvenc.append("hevc_nvenc")  
             self._nvenc_available = set(nvenc)  
+            # Pre-query caps for detected encoders  
+            for enc in list(self._nvenc_available):  
+                self._nvenc_caps[enc] = self._query_nvenc_help(enc)  
             nvenc_label = ", ".join(nvenc) if nvenc else "not detected"  
         except Exception:  
             self._nvenc_available = set()  
@@ -1000,7 +1117,16 @@ class FFmpegGUI(Gtk.Window):
         except Exception:  
             self._have_cuda_hwaccel = False  
   
-        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " + nvenc_label + (", CUDA hwaccel" if self._have_cuda_hwaccel else ""))  
+        caps_txt = []  
+        for enc, caps in self._nvenc_caps.items():  
+            c = []  
+            if caps.get('temporal_aq'): c.append("tempAQ")  
+            if caps.get('rc_lookahead'): c.append("lookahead")  
+            if caps.get('p010'): c.append("p010")  
+            if c:  
+                caps_txt.append(f"{enc}: {'/'.join(c)}")  
+        caps_line = (" | Caps: " + "; ".join(caps_txt)) if caps_txt else ""  
+        self.gpu_label.set_text("GPUs: " + ", ".join(gpus) + "\nNVENC: " + nvenc_label + (", CUDA hwaccel" if self._have_cuda_hwaccel else "") + caps_line)  
         self._prune_nvenc_from_codec_combo()  
   
     def _prune_nvenc_from_codec_combo(self):  
@@ -1019,7 +1145,7 @@ class FFmpegGUI(Gtk.Window):
             self.combo_codec.set_active(0)  
         return False  
   
-    # ----------------- Reset / misc -----------------  
+    # --------------- Reset / misc ---------------  
   
     def reset_ui(self):  
         self.process = None  
